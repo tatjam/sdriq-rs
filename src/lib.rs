@@ -611,6 +611,8 @@ mod tests {
     use std::fs::File;
 
     use super::*;
+    use num::Signed;
+    use num_complex::ComplexFloat;
 
     const I24_MIN: i32 = -8388608;
     const I24_MAX: i32 = 8388607;
@@ -924,5 +926,65 @@ mod tests {
         // Try to read past EOF, it should write no samples
         let num = source.get_samples(&mut samples).unwrap();
         assert_eq!(num, 0);
+    }
+
+    fn check_pos_and_neg<T: Signed>(samples: &[Complex<T>]) {
+        let mut has_positive_re = false;
+        let mut has_negative_re = false;
+        let mut has_positive_im = false;
+        let mut has_negative_im = false;
+        for v in samples {
+            if v.re.is_positive() {
+                has_positive_re = true;
+            }
+            if v.re.is_negative() {
+                has_negative_re = true;
+            }
+            if v.im.is_positive() {
+                has_positive_im = true;
+            }
+            if v.im.is_negative() {
+                has_negative_im = true;
+            }
+        }
+
+        assert!(has_positive_re);
+        assert!(has_negative_re);
+        assert!(has_positive_im);
+        assert!(has_negative_im);
+    }
+
+    #[test]
+    fn testsignal_offset_tone() {
+        let file = File::open("test_files/offset_tone.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+        let zero = Complex::<i32> { re: 0, im: 0 };
+        let mut samples: [Complex<i32>; 60] = [zero; 60];
+
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 60);
+
+        // We expect positive and negative in both real and imaginary
+        // as the signal is positive frequency
+        check_pos_and_neg(&samples);
+    }
+
+    #[test]
+    fn testsignal_offset_tone_norm() {
+        let file = File::open("test_files/offset_tone.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+        let zero = Complex::<f32> { re: 0.0, im: 0.0 };
+        let mut samples: [Complex<f32>; 60] = [zero; 60];
+
+        let num = source.get_samples_norm(&mut samples).unwrap();
+        assert_eq!(num, 60);
+
+        // We expect positive and negative in both real and imaginary
+        // as the signal is positive frequency
+        check_pos_and_neg(&samples);
+
+        for &sample in samples.iter() {
+            assert!(sample.norm() < 1.0);
+        }
     }
 }

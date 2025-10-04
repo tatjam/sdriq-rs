@@ -13,3 +13,4 @@ categories = ["parsing"]
 num-complex = "0.4.6"
 thiserror = "2.0.16"
 crc32fast = "1.5.0"
+num = "0.4.3" # for testing
