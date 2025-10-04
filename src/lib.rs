@@ -105,9 +105,6 @@ impl Header {
     }
 }
 
-const I24_MIN: i32 = -8388608;
-const I24_MAX: i32 = 8388607;
-
 #[doc(hidden)]
 #[inline]
 fn is_24bit(value: i32) -> bool {
@@ -317,10 +314,10 @@ impl<R: Read> Source<R> {
     /// WARNING: On big endian systems, the driect copy is not done, and instead "slow" loading is performed
     ///
     /// Returns the number of complex samples read.
-    fn get_samples_direct<T: 'static>(&mut self, tgt: &mut [Complex<T>]) -> Result<usize, ReadError>
-    where
-        T: Copy,
-    {
+    fn get_samples_direct<T: 'static>(
+        &mut self,
+        tgt: &mut [Complex<T>],
+    ) -> Result<usize, ReadError> {
         let header_bits = self.header.get_stored_bits_per_sample();
         match header_bits {
             32 => {
@@ -344,7 +341,7 @@ impl<R: Read> Source<R> {
 
         #[cfg(target_endian = "little")]
         {
-            return self.get_samples_memcpy::<T>(tgt);
+            self.get_samples_memcpy::<T>(tgt)
         }
     }
 
@@ -614,6 +611,9 @@ mod tests {
 
     use super::*;
 
+    const I24_MIN: i32 = -8388608;
+    const I24_MAX: i32 = 8388607;
+
     #[test]
     fn test_conversion_16bit() {
         // All values of i16 are fully representable by i16, i32, f32 and f64
@@ -633,7 +633,7 @@ mod tests {
         for i in i16::MIN..=i16::MAX {
             let i = i as i32;
             assert_eq!(i as i16, i16::from_i24(i).unwrap());
-            assert_eq!(i as i32, i32::from_i24(i).unwrap());
+            assert_eq!(i, i32::from_i24(i).unwrap());
             assert_eq!(i as f32, f32::from_i24(i).unwrap());
             assert_eq!(i as f64, f64::from_i24(i).unwrap());
             assert_eq!(i as f32, f32::from_i24(i).unwrap());
@@ -655,7 +655,7 @@ mod tests {
 
         // All 24 bit values are fully representable by i32, f32 and f64
         for i in I24_MIN..=I24_MAX {
-            assert_eq!(i as i32, i32::from_i24(i).unwrap());
+            assert_eq!(i, i32::from_i24(i).unwrap());
             assert_eq!(i as f32, f32::from_i24(i).unwrap());
             assert_eq!(i as f64, f64::from_i24(i).unwrap());
             assert_eq!(i as f32, f32::from_i24(i).unwrap());
