@@ -1,0 +1,10 @@
+[package]
+name = "sdriq"
+description = "Reader and writer for SDRAngel I/Q files"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+num-complex = "0.4.6"
+thiserror = "2.0.16"
+crc32fast = "1.5.0"
