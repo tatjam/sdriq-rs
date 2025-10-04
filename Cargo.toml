@@ -1,8 +1,13 @@
 [package]
 name = "sdriq"
-description = "Reader and writer for SDRAngel I/Q files"
-version = "0.1.0"
+description = "Reader and writer for SDRAngel I/Q (.sdriq) files"
+version = "0.0.1"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/tatjam/sdriq-rs"
 edition = "2024"
+readme = "README.md"
+keywords = ["sdr", "file-format"]
+categories = ["parsing"]
 
 [dependencies]
 num-complex = "0.4.6"
