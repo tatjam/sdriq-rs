@@ -745,5 +745,184 @@ mod tests {
         for &v in samples[0..num].iter() {
             assert_eq!(v, Complex::<i32> { re: 65536, im: 0 });
         }
+
+        // Try to read past EOF, it should write no samples
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 0);
+    }
+
+    #[test]
+    fn testsignal_constant_f32() {
+        let file = File::open("test_files/constant.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+        let mut samples: [Complex<f32>; 10] = Default::default();
+
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 8);
+
+        let expected = Complex::<f32> {
+            re: 65536.0,
+            im: 0.0,
+        };
+
+        for &v in samples[0..num].iter() {
+            assert_eq!(v, expected);
+        }
+    }
+
+    #[test]
+    fn testsignal_constant_f32_norm() {
+        let file = File::open("test_files/constant.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+        let mut samples: [Complex<f32>; 10] = Default::default();
+
+        let num = source.get_samples_norm(&mut samples).unwrap();
+        assert_eq!(num, 8);
+
+        let expected = Complex::<f32> {
+            re: 65536.0 / 8388608.0,
+            im: 0.0,
+        };
+
+        for &v in samples[0..num].iter() {
+            assert_eq!(v, expected);
+        }
+
+        // EOF
+        let num = source.get_samples_norm(&mut samples).unwrap();
+        assert_eq!(num, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn testsignal_constant_i16_fail() {
+        let file = File::open("test_files/constant.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+        let mut samples: [Complex<i16>; 10] = Default::default();
+
+        // This will explode because 65536 > i16::MAX
+        source.get_samples(&mut samples).unwrap();
+    }
+
+    #[test]
+    fn testsignal_constant_clamp() {
+        let file = File::open("test_files/constant.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+        let mut samples: [Complex<i16>; 10] = Default::default();
+
+        let num = source.get_samples_clamp(&mut samples).unwrap();
+        assert_eq!(num, 8);
+
+        let expected = Complex::<i16> {
+            re: i16::MAX,
+            im: 0,
+        };
+
+        for &v in samples[0..num].iter() {
+            assert_eq!(v, expected);
+        }
+
+        // EOF
+        let num = source.get_samples_clamp(&mut samples).unwrap();
+        assert_eq!(num, 0);
+    }
+
+    #[derive(Default, Copy, Clone, PartialEq, Eq, Debug)]
+    struct CustomI32 {
+        v: i32,
+    }
+
+    impl SampleConvert for CustomI32 {
+        fn from_i16(value: i16) -> Option<Self> {
+            Some(Self { v: value as i32 })
+        }
+
+        fn from_i24(value: i32) -> Option<Self> {
+            Some(Self { v: value })
+        }
+
+        fn from_i16_clamp(value: i16) -> Self {
+            Self { v: value as i32 }
+        }
+
+        fn from_i24_clamp(value: i32) -> Self {
+            Self { v: value as i32 }
+        }
+    }
+
+    #[test]
+    fn testsignal_constant_custom_type_get_samples() {
+        let file = File::open("test_files/constant.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+
+        let mut samples: [Complex<CustomI32>; 10] = Default::default();
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 8);
+
+        let expected = Complex::<CustomI32> {
+            re: CustomI32 { v: 65536 },
+            im: CustomI32 { v: 0 },
+        };
+
+        for &v in samples[0..num].iter() {
+            assert_eq!(v, expected);
+        }
+
+        // Try to read past EOF, it should write no samples
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 0);
+    }
+
+    #[test]
+    fn testsignal_constant_custom_type_partial_read() {
+        let file = File::open("test_files/constant.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+
+        let mut samples: [Complex<CustomI32>; 4] = Default::default();
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 4);
+
+        let expected = Complex::<CustomI32> {
+            re: CustomI32 { v: 65536 },
+            im: CustomI32 { v: 0 },
+        };
+
+        for v in samples {
+            assert_eq!(v, expected);
+        }
+
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 4);
+
+        for v in samples {
+            assert_eq!(v, expected);
+        }
+
+        // Try to read past EOF, it should write no samples
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 0);
+    }
+
+    #[test]
+    fn testsignal_constant_custom_type_excessive_read() {
+        let file = File::open("test_files/constant.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+
+        let mut samples: [Complex<CustomI32>; 10] = Default::default();
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 8);
+
+        let expected = Complex::<CustomI32> {
+            re: CustomI32 { v: 65536 },
+            im: CustomI32 { v: 0 },
+        };
+
+        for &v in samples[0..num].iter() {
+            assert_eq!(v, expected);
+        }
+
+        // Try to read past EOF, it should write no samples
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 0);
     }
 }
