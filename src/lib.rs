@@ -1,4 +1,7 @@
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::{
+    any::TypeId,
+    io::{BufRead, BufReader, BufWriter, Read, Write},
+};
 use thiserror::Error;
 
 use num_complex::Complex;
@@ -7,10 +10,14 @@ use num_complex::Complex;
 pub enum ReadError {
     #[error("Header is incomplete")]
     HeaderIncomplete(),
-    #[error("header CRC {header:?} does not match computed CRC {expected:?}")]
+    #[error("Header CRC {header:?} does not match computed CRC {expected:?}")]
     HeaderInvalidCRC { header: u32, expected: u32 },
+    #[error("Header sample size is invalid value {samp_size:?}")]
+    HeaderSampleSizeInvalid { samp_size: u32 },
     #[error("I/O error")]
     IOError(#[from] std::io::Error),
+    #[error("Sample size stored in the file is not compatible with target type")]
+    InvalidSampleSize(),
 }
 pub enum WriteError {}
 
@@ -21,7 +28,7 @@ pub struct Header {
     center_freq: u64,
     /// Unix timestamp (ms) of the first sample in the file
     start_timestamp: u64,
-    /// Sample size, either 16 or 24 bits
+    /// Sample size, either 16 (stored as 16 bits) or 24 bits (stored as 32 bits)
     samp_size: u32,
 }
 
@@ -57,7 +64,11 @@ impl Header {
                 .expect("We have 32 bytes, this is guaranteed to succeed"),
         );
 
-        // 4 bytes of padding skipped
+        if samp_size != 16 || samp_size != 24 {
+            return Err(ReadError::HeaderSampleSizeInvalid { samp_size });
+        }
+
+        // 4 bytes of padding / zeroes skipped
 
         let crc32_computed = crc32fast::hash(&header_bytes[0..28]);
 
@@ -80,6 +91,106 @@ impl Header {
             start_timestamp,
             samp_size,
         })
+    }
+
+    /// Returns the number of
+    pub fn get_stored_bits_per_sample(&self) -> usize {
+        match self.samp_size {
+            16 => 16,
+            24 => 32,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[doc(hidden)]
+#[inline]
+fn is_24bit(value: i32) -> bool {
+    (value << 8) >> 8 == value
+}
+
+pub trait SampleConvert: Copy + Sized {
+    fn from_i16(value: i16) -> Option<Self>;
+    fn from_i24(value: i32) -> Option<Self>;
+}
+
+impl SampleConvert for i16 {
+    fn from_i16(value: i16) -> Option<Self> {
+        Some(value)
+    }
+
+    fn from_i24(value: i32) -> Option<Self> {
+        i16::try_from(value).ok()
+    }
+}
+
+impl SampleConvert for i32 {
+    fn from_i16(value: i16) -> Option<Self> {
+        Some(value as i32)
+    }
+
+    fn from_i24(value: i32) -> Option<Self> {
+        Some(value)
+    }
+}
+
+impl SampleConvert for f32 {
+    fn from_i16(value: i16) -> Option<Self> {
+        Some(value as f32)
+    }
+
+    fn from_i24(value: i32) -> Option<Self> {
+        // 24 bits can be fully represented as f32, but 32 bit cannot!
+        debug_assert!(is_24bit(value), "value was not 24 bit");
+        Some(value as f32)
+    }
+}
+
+impl SampleConvert for f64 {
+    fn from_i16(value: i16) -> Option<Self> {
+        Some(value as f64)
+    }
+
+    fn from_i24(value: i32) -> Option<Self> {
+        Some(value as f64)
+    }
+}
+
+const I16_SCALE_F32: f32 = 1.0 / 32768.0;
+const I32_SCALE_F32: f32 = 1.0 / 8388608.0;
+const I16_SCALE_F64: f64 = 1.0 / 32768.0;
+const I32_SCALE_F64: f64 = 1.0 / 8388608.0;
+
+/// For 16 bit numbers, maps [-32768, 32767] -> [-1, 0.9999694824]
+/// For 24 bit numbers, maps [-8388608, 8388607] -> [-1, 0.9999998808]
+/// This guarantees 0 is mapped to 0. The error introduced is insignificant for almost any use, but be aware that
+/// the returned values will always be contained in the interval [-1, 1).
+pub trait SampleNormalizedConvert: Copy + Sized {
+    fn from_i16(value: i16) -> Self;
+    fn from_i24(value: i32) -> Self;
+}
+
+impl SampleNormalizedConvert for f32 {
+    fn from_i16(value: i16) -> Self {
+        (value as f32) * I16_SCALE_F32
+    }
+
+    fn from_i24(value: i32) -> Self {
+        // This would result in values outside [-1, 1]
+        debug_assert!(is_24bit(value), "value was not 24 bit");
+        (value as f32) * I32_SCALE_F32
+    }
+}
+
+impl SampleNormalizedConvert for f64 {
+    fn from_i16(value: i16) -> Self {
+        (value as f64) * I16_SCALE_F64
+    }
+
+    fn from_i24(value: i32) -> Self {
+        // This would result in values outside [-1, 1]
+        debug_assert!(is_24bit(value), "value was not 24 bit");
+        (value as f64) * I32_SCALE_F64
     }
 }
 
@@ -106,24 +217,163 @@ impl<R: Read> Source<R> {
         Ok(Self { header, reader })
     }
 
-    /// Returns samples, as long as they are directly readable to Complex<T> type without any
-    /// conversion being performed. This is fast, as it's a simple memory copy.
-    /// Valid types for T are i32 (for 24 bit samples) or i16 (for 16 bit samples)
-    fn get_samples<T>(target: &mut [Complex<T>]) -> Result<usize, ReadError> {
-        todo!("Implement");
+    /// Returns the header applicable to this Source
+    fn get_header(&self) -> &Header {
+        &self.header
+    }
+
+    #[doc(hidden)]
+    // Reads samples by memcpy as long as sizeof(T) is correct. Not intented to be used directly.
+    fn get_samples_memcpy<T>(&mut self, target: &mut [Complex<T>]) -> Result<usize, ReadError> {
+        let header_bits = self.header.get_stored_bits_per_sample();
+        let incoming_bits = std::mem::size_of::<T>();
+        if header_bits != incoming_bits {
+            return Err(ReadError::InvalidSampleSize());
+        }
+
+        let mut num_written: usize = 0;
+        let bytes_per_sample = std::mem::size_of::<T>() * 2;
+
+        while num_written < target.len() {
+            let num_remain = target.len() - num_written;
+            let buffer = self.reader.fill_buf()?;
+            if buffer.is_empty() {
+                // EOF
+                break;
+            }
+
+            let num_in_buf = buffer.len() / bytes_per_sample;
+
+            if num_in_buf == 0 {
+                // Partial EOF
+                // TODO: This could be reported as an error, as the file is expected to contain non-truncated samples
+                break;
+            }
+
+            let num_copy = num_remain.min(num_in_buf);
+            let target_ptr = target[num_written..].as_mut_ptr() as *mut u8;
+
+            unsafe {
+                // SAFETY:
+                // - target_ptr contains atleast num_remain samples
+                // - buffer contains num_in_buf samples
+                // - num_copy = min(num_in_buf, num_remain), so no out of bounds access can take place
+                std::ptr::copy_nonoverlapping(
+                    buffer.as_ptr(),
+                    target_ptr,
+                    num_copy * bytes_per_sample,
+                );
+            }
+
+            self.reader.consume(num_copy * bytes_per_sample);
+            num_written += num_copy;
+        }
+
+        Ok(num_written)
+    }
+
+    /// Reads samples, as long as they are directly copyable to Complex<T> type without any
+    /// conversion being performed. This is fast, as it's a simple, flat memory copy.
+    ///
+    /// WARNING: On big endian systems, the driect copy is not done, and instead "slow" loading is performed
+    ///
+    /// Returns the number of complex samples read.
+    fn get_samples_direct<T: 'static>(&mut self, tgt: &mut [Complex<T>]) -> Result<usize, ReadError>
+    where
+        T: Copy,
+    {
+        let header_bits = self.header.get_stored_bits_per_sample();
+        match header_bits {
+            32 => {
+                if TypeId::of::<T>() != TypeId::of::<i32>() {
+                    return Err(ReadError::InvalidSampleSize());
+                }
+            }
+            16 => {
+                if TypeId::of::<T>() != TypeId::of::<i16>() {
+                    return Err(ReadError::InvalidSampleSize());
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            // Fall-back to slow reading
+            return self.get_samples::<T>(tgt);
+        }
+
+        #[cfg(target_endian = "little")]
+        {
+            return self.get_samples_memcpy::<T>(tgt);
+        }
     }
 
     /// Read samples, with possible conversion if type Complex<T> does not match the incoming type
     /// from the sdriq file. This could have slight overhead.
     /// If the conversion would result in truncation (for example, 24 bits -> i16), an error is generated.
-    fn get_samples_conv<T>(target: &mut [Complex<T>]) -> Result<usize, ReadError> {
+    ///
+    /// No truncation errors are ever generated is T is a floating point number, as 24 bit integers can fully
+    /// fit into f32.  Note that the resulting floating point numbers are NOT normalized!
+    ///
+    /// Note that this function will choose the most optimized possible call for the type "T"
+    ///
+    /// Returns the number of samples read.
+    fn get_samples<T: 'static>(&mut self, target: &mut [Complex<T>]) -> Result<usize, ReadError>
+    where
+        T: Copy,
+    {
+        // Try optimized functions if possible
+        let header_bits = self.header.get_stored_bits_per_sample();
+        if TypeId::of::<T>() == TypeId::of::<i32>() && header_bits == 32 {
+            return self.get_samples_direct(target);
+        }
+        if TypeId::of::<T>() == TypeId::of::<i16>() && header_bits == 16 {
+            return self.get_samples_direct(target);
+        }
+
+        // Fallback "slow" method
+        let mut num_read = 0;
+        while num_read < target.len() {
+            let buffer: [u8; 4];
+        }
+
         todo!("Implement");
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn read_next_sample_24bit<T>(&mut self) -> Result<Option<Complex<T>>, ReadError> {
+        let mut buffer_i: [u8; 4] = [0; 4];
+        let mut buffer_q: [u8; 4] = [0; 4];
+        let mut num_read = self.reader.read(&mut buffer_i)?;
+        num_read += self.reader.read(&mut buffer_q)?;
+
+        if num_read == 0 {
+            return Ok(None);
+        }
+        if num_read < 8 {
+            // TODO: This could be reported as an error, as the file is expected to contain non-truncated samples
+            return Ok(None);
+        }
+
+        let i = i32::from_le_bytes(buffer_i);
+        let q = i32::from_le_bytes(buffer_q);
+
+        Ok(Some(Complex::<T> {
+            re: i as T,
+            im: q as T,
+        }))
     }
 
     /// Read samples, with possible conversion if type Complex<T> does not match the incoming type
     /// from the sdriq file. This could have slight overhead.
     /// Allows silent truncating conversion if the target type is too small
-    fn get_samples_trunc<T>(target: &mut [Complex<T>]) -> Result<usize, ReadError> {
+    ///
+    /// Note that this function will choose the most optimized possible call for the type "T"
+    ///
+    /// Returns the number of samples read.
+    fn get_samples_trunc<T>(&mut self, target: &mut [Complex<T>]) -> Result<usize, ReadError> {
         todo!("Implement");
     }
 
@@ -131,7 +381,7 @@ impl<R: Read> Source<R> {
     /// The original range is deduced from the bit-size of the samples, so
     /// - 16 bit samples map [-32768, 32767] -> [-1, 1]
     /// - 24 bit samples map [-16777216, 16777215] -> [-1, 1]
-    fn get_samples_norm<T>(target: &mut [Complex<T>]) -> Result<usize, ReadError> {
+    fn get_samples_norm<T>(&mut self, target: &mut [Complex<T>]) -> Result<usize, ReadError> {
         todo!("Implement");
     }
 }
@@ -152,7 +402,7 @@ mod tests {
 
     #[test]
     fn read_16bit_file() {
-        let file = File::open("test_files/test_1.sdriq").unwrap();
+        let file = File::open("test_files/16_bit.sdriq").unwrap();
         let source = Source::new(file);
     }
 
