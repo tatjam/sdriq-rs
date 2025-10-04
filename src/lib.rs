@@ -1,3 +1,37 @@
+//! # sdriq - Read and write .sdriq files
+//! **The library is in active development, the API may change!**
+//!
+//! ## Example
+//!
+//! ```
+//! use sdriq::Source;
+//! use num_complex::Complex;
+//! use std::fs::File;
+//!
+//! let file = File::open("file.sdriq").unwrap();
+//! let mut source = Source::new(file).unwrap();
+//! let mut samples = vec![Complex::new(0.0, 0.0); 1000000];
+//! let num_samples = source.get_samples_norm(&mut samples).unwrap();
+//!
+//! let average = samples[0..num_samples]
+//!     .iter()
+//!     .fold(Complex::new(0.0, 0.0), |acc, &e| acc + e)
+//!     / (num_samples as f32);
+//!
+//! println!("Average of first {} samples = {}", num_samples, average);
+//!
+//! ```
+//!
+//! ## Development state
+//!
+//! **Not yet implemented**:
+//! - Writing files (Sink)
+//! - Benchmarking and performance tuning
+//!
+//! **Not yet tested**:
+//! - 16 bit files (requires recompiling sdrangel)
+//!
+
 use std::{
     any::TypeId,
     io::{BufRead, BufReader, BufWriter, Read, Write},
@@ -309,7 +343,7 @@ impl<R: Read> Source<R> {
         Ok(num_written)
     }
 
-    /// Reads samples, as long as they are directly copyable to Complex<T> type without any
+    /// Reads samples, as long as they are directly copyable to `Complex<T>` type without any
     /// conversion being performed. This is fast, as it's a simple, flat memory copy.
     ///
     /// WARNING: On big endian systems, the driect copy is not done, and instead "slow" loading is performed
@@ -346,7 +380,7 @@ impl<R: Read> Source<R> {
         }
     }
 
-    /// Read samples, with possible conversion if type Complex<T> does not match the incoming type
+    /// Read samples, with possible conversion if type `Complex<T>` does not match the incoming type
     /// from the sdriq file. This could have slight overhead.
     /// If the conversion would result in truncation (for example, 24 bits -> i16), an error is generated.
     ///
@@ -530,7 +564,7 @@ impl<R: Read> Source<R> {
         }))
     }
 
-    /// Read samples, with possible conversion if type Complex<T> does not match the incoming type
+    /// Read samples, with possible conversion if type `Complex<T>` does not match the incoming type
     /// from the sdriq file. This could have slight overhead.
     /// If T is too small (i16) and the incoming number if bigger, it will be clamped.
     ///
@@ -987,4 +1021,14 @@ mod tests {
             assert!(sample.norm() < 1.0);
         }
     }
+
+    #[test]
+    #[should_panic]
+    fn header_not_verify_crc() {
+        let file = File::open("test_files/malformed.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+    }
+
+    #[test]
+    fn test() {}
 }
