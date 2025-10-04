@@ -18,6 +18,8 @@ pub enum ReadError {
     IOError(#[from] std::io::Error),
     #[error("Sample size stored in the file is not compatible with target type")]
     InvalidSampleSize(),
+    #[error("Reading sample would truncate")]
+    TruncationError(),
 }
 pub enum WriteError {}
 
@@ -103,6 +105,9 @@ impl Header {
     }
 }
 
+const I24_MIN: i32 = -8388608;
+const I24_MAX: i32 = 8388607;
+
 #[doc(hidden)]
 #[inline]
 fn is_24bit(value: i32) -> bool {
@@ -112,6 +117,8 @@ fn is_24bit(value: i32) -> bool {
 pub trait SampleConvert: Copy + Sized {
     fn from_i16(value: i16) -> Option<Self>;
     fn from_i24(value: i32) -> Option<Self>;
+    fn from_i16_clamp(value: i16) -> Self;
+    fn from_i24_clamp(value: i32) -> Self;
 }
 
 impl SampleConvert for i16 {
@@ -122,6 +129,14 @@ impl SampleConvert for i16 {
     fn from_i24(value: i32) -> Option<Self> {
         i16::try_from(value).ok()
     }
+
+    fn from_i16_clamp(value: i16) -> Self {
+        value as Self
+    }
+
+    fn from_i24_clamp(value: i32) -> Self {
+        value.clamp(i16::MIN as i32, i16::MAX as i32) as Self
+    }
 }
 
 impl SampleConvert for i32 {
@@ -131,6 +146,14 @@ impl SampleConvert for i32 {
 
     fn from_i24(value: i32) -> Option<Self> {
         Some(value)
+    }
+
+    fn from_i16_clamp(value: i16) -> Self {
+        value as Self
+    }
+
+    fn from_i24_clamp(value: i32) -> Self {
+        value as Self
     }
 }
 
@@ -144,6 +167,14 @@ impl SampleConvert for f32 {
         debug_assert!(is_24bit(value), "value was not 24 bit");
         Some(value as f32)
     }
+
+    fn from_i16_clamp(value: i16) -> Self {
+        value as Self
+    }
+
+    fn from_i24_clamp(value: i32) -> Self {
+        value as Self
+    }
 }
 
 impl SampleConvert for f64 {
@@ -153,6 +184,14 @@ impl SampleConvert for f64 {
 
     fn from_i24(value: i32) -> Option<Self> {
         Some(value as f64)
+    }
+
+    fn from_i16_clamp(value: i16) -> Self {
+        value as Self
+    }
+
+    fn from_i24_clamp(value: i32) -> Self {
+        value as Self
     }
 }
 
@@ -166,16 +205,16 @@ const I32_SCALE_F64: f64 = 1.0 / 8388608.0;
 /// This guarantees 0 is mapped to 0. The error introduced is insignificant for almost any use, but be aware that
 /// the returned values will always be contained in the interval [-1, 1).
 pub trait SampleNormalizedConvert: Copy + Sized {
-    fn from_i16(value: i16) -> Self;
-    fn from_i24(value: i32) -> Self;
+    fn from_i16_norm(value: i16) -> Self;
+    fn from_i24_norm(value: i32) -> Self;
 }
 
 impl SampleNormalizedConvert for f32 {
-    fn from_i16(value: i16) -> Self {
+    fn from_i16_norm(value: i16) -> Self {
         (value as f32) * I16_SCALE_F32
     }
 
-    fn from_i24(value: i32) -> Self {
+    fn from_i24_norm(value: i32) -> Self {
         // This would result in values outside [-1, 1)
         debug_assert!(is_24bit(value), "value was not 24 bit");
         (value as f32) * I32_SCALE_F32
@@ -183,11 +222,11 @@ impl SampleNormalizedConvert for f32 {
 }
 
 impl SampleNormalizedConvert for f64 {
-    fn from_i16(value: i16) -> Self {
+    fn from_i16_norm(value: i16) -> Self {
         (value as f64) * I16_SCALE_F64
     }
 
-    fn from_i24(value: i32) -> Self {
+    fn from_i24_norm(value: i32) -> Self {
         // This would result in values outside [-1, 1)
         debug_assert!(is_24bit(value), "value was not 24 bit");
         (value as f64) * I32_SCALE_F64
@@ -246,7 +285,7 @@ impl<R: Read> Source<R> {
 
             if num_in_buf == 0 {
                 // Partial EOF
-                // TODO: This could be reported as an error, as the file is expected to contain non-truncated samples
+                // TODO: This could be reported as an error, as the file is expected to contain non-clampated samples
                 break;
             }
 
@@ -314,15 +353,16 @@ impl<R: Read> Source<R> {
     /// If the conversion would result in truncation (for example, 24 bits -> i16), an error is generated.
     ///
     /// No truncation errors are ever generated is T is a floating point number, as 24 bit integers can fully
-    /// fit into f32.  Note that the resulting floating point numbers are NOT normalized!
+    /// fit into f32.
+    /// Note that the resulting floating point numbers are NOT normalized!
     ///
     /// Note that this function will choose the most optimized possible call for the type "T"
     ///
     /// Returns the number of samples read.
-    fn get_samples<T: 'static>(&mut self, target: &mut [Complex<T>]) -> Result<usize, ReadError>
-    where
-        T: Copy,
-    {
+    fn get_samples<T: SampleConvert + 'static>(
+        &mut self,
+        target: &mut [Complex<T>],
+    ) -> Result<usize, ReadError> {
         // Try optimized functions if possible
         let header_bits = self.header.get_stored_bits_per_sample();
         if TypeId::of::<T>() == TypeId::of::<i32>() && header_bits == 32 {
@@ -335,15 +375,48 @@ impl<R: Read> Source<R> {
         // Fallback "slow" method
         let mut num_read = 0;
         while num_read < target.len() {
-            let buffer: [u8; 4];
+            let maybe_smp = match self.header.samp_size {
+                16 => self.read_next_sample_16bit::<T>()?,
+                24 => self.read_next_sample_24bit::<T>()?,
+                _ => unreachable!(),
+            };
+
+            target[num_read] = match maybe_smp {
+                Some(v) => v,
+                None => break,
+            };
+
+            num_read += 1
         }
 
-        todo!("Implement");
+        Ok(num_read)
     }
 
     #[inline]
     #[doc(hidden)]
-    fn read_next_sample_24bit<T>(&mut self) -> Result<Option<Complex<T>>, ReadError> {
+    fn read_raw_16bit(&mut self) -> Result<Option<(i16, i16)>, ReadError> {
+        let mut buffer_i: [u8; 2] = [0; 2];
+        let mut buffer_q: [u8; 2] = [0; 2];
+        let mut num_read = self.reader.read(&mut buffer_i)?;
+        num_read += self.reader.read(&mut buffer_q)?;
+
+        if num_read == 0 {
+            return Ok(None);
+        }
+        if num_read < 4 {
+            // TODO: This could be reported as an error, as the file is expected to contain full samples
+            return Ok(None);
+        }
+
+        let i = i16::from_le_bytes(buffer_i);
+        let q = i16::from_le_bytes(buffer_q);
+
+        Ok(Some((i, q)))
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn read_raw_24bit(&mut self) -> Result<Option<(i32, i32)>, ReadError> {
         let mut buffer_i: [u8; 4] = [0; 4];
         let mut buffer_q: [u8; 4] = [0; 4];
         let mut num_read = self.reader.read(&mut buffer_i)?;
@@ -353,40 +426,181 @@ impl<R: Read> Source<R> {
             return Ok(None);
         }
         if num_read < 8 {
-            // TODO: This could be reported as an error, as the file is expected to contain non-truncated samples
+            // TODO: This could be reported as an error, as the file is expected to contain full samples
             return Ok(None);
         }
 
         let i = i32::from_le_bytes(buffer_i);
         let q = i32::from_le_bytes(buffer_q);
 
+        Ok(Some((i, q)))
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn read_next_sample_16bit<T: SampleConvert>(
+        &mut self,
+    ) -> Result<Option<Complex<T>>, ReadError> {
+        let (i, q) = match self.read_raw_16bit()? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
         Ok(Some(Complex::<T> {
-            re: i as T,
-            im: q as T,
+            re: T::from_i16(i).ok_or(ReadError::TruncationError())?,
+            im: T::from_i16(q).ok_or(ReadError::TruncationError())?,
+        }))
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn read_next_sample_24bit<T: SampleConvert>(
+        &mut self,
+    ) -> Result<Option<Complex<T>>, ReadError> {
+        let (i, q) = match self.read_raw_24bit()? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        Ok(Some(Complex::<T> {
+            re: T::from_i24(i).ok_or(ReadError::TruncationError())?,
+            im: T::from_i24(q).ok_or(ReadError::TruncationError())?,
+        }))
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn read_next_sample_16bit_clamp<T: SampleConvert>(
+        &mut self,
+    ) -> Result<Option<Complex<T>>, ReadError> {
+        let (i, q) = match self.read_raw_16bit()? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        Ok(Some(Complex::<T> {
+            re: T::from_i16_clamp(i),
+            im: T::from_i16_clamp(q),
+        }))
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn read_next_sample_24bit_clamp<T: SampleConvert>(
+        &mut self,
+    ) -> Result<Option<Complex<T>>, ReadError> {
+        let (i, q) = match self.read_raw_24bit()? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        Ok(Some(Complex::<T> {
+            re: T::from_i24_clamp(i),
+            im: T::from_i24_clamp(q),
+        }))
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn read_next_sample_16bit_norm<T: SampleNormalizedConvert>(
+        &mut self,
+    ) -> Result<Option<Complex<T>>, ReadError> {
+        let (i, q) = match self.read_raw_16bit()? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        Ok(Some(Complex::<T> {
+            re: T::from_i16_norm(i),
+            im: T::from_i16_norm(q),
+        }))
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn read_next_sample_24bit_norm<T: SampleNormalizedConvert>(
+        &mut self,
+    ) -> Result<Option<Complex<T>>, ReadError> {
+        let (i, q) = match self.read_raw_24bit()? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        Ok(Some(Complex::<T> {
+            re: T::from_i24_norm(i),
+            im: T::from_i24_norm(q),
         }))
     }
 
     /// Read samples, with possible conversion if type Complex<T> does not match the incoming type
     /// from the sdriq file. This could have slight overhead.
-    /// Allows silent truncating conversion if the target type is too small
+    /// If T is too small (i16) and the incoming number if bigger, it will be clamped.
     ///
     /// Note that this function will choose the most optimized possible call for the type "T"
     ///
     /// Returns the number of samples read.
-    fn get_samples_trunc<T>(&mut self, target: &mut [Complex<T>]) -> Result<usize, ReadError> {
-        todo!("Implement");
+    fn get_samples_clamp<T: SampleConvert + 'static>(
+        &mut self,
+        target: &mut [Complex<T>],
+    ) -> Result<usize, ReadError> {
+        // Try optimized functions if possible
+        let header_bits = self.header.get_stored_bits_per_sample();
+        if TypeId::of::<T>() == TypeId::of::<i32>() && header_bits == 32 {
+            return self.get_samples_direct(target);
+        }
+        if TypeId::of::<T>() == TypeId::of::<i16>() && header_bits == 16 {
+            return self.get_samples_direct(target);
+        }
+
+        // Fallback "slow" method
+        let mut num_read = 0;
+        while num_read < target.len() {
+            let maybe_smp = match self.header.samp_size {
+                16 => self.read_next_sample_16bit_clamp::<T>()?,
+                24 => self.read_next_sample_24bit_clamp::<T>()?,
+                _ => unreachable!(),
+            };
+
+            target[num_read] = match maybe_smp {
+                Some(v) => v,
+                None => break,
+            };
+
+            num_read += 1
+        }
+
+        Ok(num_read)
     }
 
     /// Read samples, normalizing them to [-1, 1] range, so T must be a floating point type (f32 or f64).
     /// The original range is deduced from the bit-size of the samples, so
     /// - 16 bit samples map [-32768, 32767] -> [-1, 1]
     /// - 24 bit samples map [-16777216, 16777215] -> [-1, 1]
-    fn get_samples_norm<T>(&mut self, target: &mut [Complex<T>]) -> Result<usize, ReadError> {
-        todo!("Implement");
+    fn get_samples_norm<T: SampleNormalizedConvert>(
+        &mut self,
+        target: &mut [Complex<T>],
+    ) -> Result<usize, ReadError> {
+        let mut num_read = 0;
+        while num_read < target.len() {
+            let maybe_smp = match self.header.samp_size {
+                16 => self.read_next_sample_16bit_norm::<T>()?,
+                24 => self.read_next_sample_24bit_norm::<T>()?,
+                _ => unreachable!(),
+            };
+
+            target[num_read] = match maybe_smp {
+                Some(v) => v,
+                None => break,
+            };
+
+            num_read += 1
+        }
+
+        Ok(num_read)
     }
 }
 
-/// A Source wraps around a Write to be able to write samples to an sdriq file. Samples are written by
+/// A Sink wraps around a Write to be able to write samples to an sdriq file. Samples are written by
 /// copying from an array of Complex values, optionally performing type conversion (at a slight
 /// performance cost, of course!)
 struct Sink<W: Write> {
@@ -399,6 +613,70 @@ mod tests {
     use std::fs::File;
 
     use super::*;
+
+    #[test]
+    fn test_conversion_16bit() {
+        // All values of i16 are fully representable by i16, i32, f32 and f64
+        for i in i16::MIN..=i16::MAX {
+            assert_eq!(i, i16::from_i16(i).unwrap());
+            assert_eq!(i as i32, i32::from_i16(i).unwrap());
+            assert_eq!(i as f32, f32::from_i16(i).unwrap());
+            assert_eq!(i as f64, f64::from_i16(i).unwrap());
+            assert_eq!(i as f32, f32::from_i16(i).unwrap());
+            assert_eq!(i as f64, f64::from_i16(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_conversion_24bit() {
+        // All 16 bit values are fully representable by i16, i32, f32 and f64
+        for i in i16::MIN..=i16::MAX {
+            let i = i as i32;
+            assert_eq!(i as i16, i16::from_i24(i).unwrap());
+            assert_eq!(i as i32, i32::from_i24(i).unwrap());
+            assert_eq!(i as f32, f32::from_i24(i).unwrap());
+            assert_eq!(i as f64, f64::from_i24(i).unwrap());
+            assert_eq!(i as f32, f32::from_i24(i).unwrap());
+            assert_eq!(i as f64, f64::from_i24(i).unwrap());
+        }
+
+        // Not all 24 bit values are representable by i16, but they are correctly clipped
+        for i in I24_MIN..=I24_MAX {
+            let i_clamp = i16::from_i24_clamp(i);
+            if i_clamp as i32 != i {
+                assert!(i16::from_i24(i).is_none());
+                if i < 0 {
+                    assert!(i_clamp == i16::MIN);
+                } else {
+                    assert!(i_clamp == i16::MAX);
+                }
+            }
+        }
+
+        // All 24 bit values are fully representable by i32, f32 and f64
+        for i in I24_MIN..=I24_MAX {
+            assert_eq!(i as i32, i32::from_i24(i).unwrap());
+            assert_eq!(i as f32, f32::from_i24(i).unwrap());
+            assert_eq!(i as f64, f64::from_i24(i).unwrap());
+            assert_eq!(i as f32, f32::from_i24(i).unwrap());
+            assert_eq!(i as f64, f64::from_i24(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn is_24bit_checks() {
+        assert!(is_24bit(0));
+        assert!(is_24bit(1));
+        assert!(is_24bit(-1));
+        assert!(is_24bit(I24_MIN));
+        assert!(is_24bit(I24_MAX));
+        assert!(!is_24bit(I24_MIN - 1));
+        assert!(!is_24bit(I24_MAX + 1));
+        assert!(!is_24bit(I24_MIN - 1000));
+        assert!(!is_24bit(I24_MAX + 1000));
+        assert!(!is_24bit(i32::MIN));
+        assert!(!is_24bit(i32::MAX));
+    }
 
     #[test]
     fn read_16bit_file() {
