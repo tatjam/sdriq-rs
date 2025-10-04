@@ -176,7 +176,7 @@ impl SampleNormalizedConvert for f32 {
     }
 
     fn from_i24(value: i32) -> Self {
-        // This would result in values outside [-1, 1]
+        // This would result in values outside [-1, 1)
         debug_assert!(is_24bit(value), "value was not 24 bit");
         (value as f32) * I32_SCALE_F32
     }
@@ -188,7 +188,7 @@ impl SampleNormalizedConvert for f64 {
     }
 
     fn from_i24(value: i32) -> Self {
-        // This would result in values outside [-1, 1]
+        // This would result in values outside [-1, 1)
         debug_assert!(is_24bit(value), "value was not 24 bit");
         (value as f64) * I32_SCALE_F64
     }
