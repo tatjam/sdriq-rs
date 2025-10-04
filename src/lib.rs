@@ -23,15 +23,16 @@ pub enum ReadError {
 }
 pub enum WriteError {}
 
+#[derive(Copy, Clone, PartialEq)]
 pub struct Header {
     /// Sample rate in samples per second
-    samp_rate: u32,
+    pub samp_rate: u32,
     /// Center frequency in Hz
-    center_freq: u64,
+    pub center_freq: u64,
     /// Unix timestamp (ms) of the first sample in the file
-    start_timestamp: u64,
+    pub start_timestamp: u64,
     /// Sample size, either 16 (stored as 16 bits) or 24 bits (stored as 32 bits)
-    samp_size: u32,
+    pub samp_size: u32,
 }
 
 impl Header {
@@ -66,7 +67,7 @@ impl Header {
                 .expect("We have 32 bytes, this is guaranteed to succeed"),
         );
 
-        if samp_size != 16 || samp_size != 24 {
+        if samp_size != 16 && samp_size != 24 {
             return Err(ReadError::HeaderSampleSizeInvalid { samp_size });
         }
 
@@ -241,28 +242,28 @@ pub struct Source<R: Read> {
 impl<R: Read> Source<R> {
     /// Creates a sample reader, expecting to find a valid header on the first few bytes of the Read argument.
     /// Uses a sane-default for the internal buffer size, which should perform acceptably on most use cases.
-    fn new(source: R) -> Result<Self, ReadError> {
+    pub fn new(source: R) -> Result<Self, ReadError> {
         // Default buffer size holds a bit over 1sec of 1Msps 16 bit samples, rounded to nearest power of 2
         Self::with_capacity(2097152, source)
     }
 
     /// Creates a sample reader, expecting to find a valid header on the first few bytes of the Read argument.
-    fn with_capacity(bytes: usize, source: R) -> Result<Self, ReadError> {
+    pub fn with_capacity(bytes: usize, source: R) -> Result<Self, ReadError> {
         let mut reader = BufReader::with_capacity(bytes, source);
         let header = Header::new(&mut reader)?;
         Ok(Self { header, reader })
     }
 
     /// Returns the header applicable to this Source
-    fn get_header(&self) -> &Header {
-        &self.header
+    pub fn get_header(&self) -> Header {
+        self.header
     }
 
     #[doc(hidden)]
     // Reads samples by memcpy as long as sizeof(T) is correct. Not intented to be used directly.
     fn get_samples_memcpy<T>(&mut self, target: &mut [Complex<T>]) -> Result<usize, ReadError> {
         let header_bits = self.header.get_stored_bits_per_sample();
-        let incoming_bits = std::mem::size_of::<T>();
+        let incoming_bits = std::mem::size_of::<T>() * 8;
         if header_bits != incoming_bits {
             return Err(ReadError::InvalidSampleSize());
         }
@@ -314,7 +315,7 @@ impl<R: Read> Source<R> {
     /// WARNING: On big endian systems, the driect copy is not done, and instead "slow" loading is performed
     ///
     /// Returns the number of complex samples read.
-    fn get_samples_direct<T: 'static>(
+    pub fn get_samples_direct<T: 'static>(
         &mut self,
         tgt: &mut [Complex<T>],
     ) -> Result<usize, ReadError> {
@@ -356,7 +357,7 @@ impl<R: Read> Source<R> {
     /// Note that this function will choose the most optimized possible call for the type "T"
     ///
     /// Returns the number of samples read.
-    fn get_samples<T: SampleConvert + 'static>(
+    pub fn get_samples<T: SampleConvert + 'static>(
         &mut self,
         target: &mut [Complex<T>],
     ) -> Result<usize, ReadError> {
@@ -536,7 +537,7 @@ impl<R: Read> Source<R> {
     /// Note that this function will choose the most optimized possible call for the type "T"
     ///
     /// Returns the number of samples read.
-    fn get_samples_clamp<T: SampleConvert + 'static>(
+    pub fn get_samples_clamp<T: SampleConvert + 'static>(
         &mut self,
         target: &mut [Complex<T>],
     ) -> Result<usize, ReadError> {
@@ -573,7 +574,7 @@ impl<R: Read> Source<R> {
     /// The original range is deduced from the bit-size of the samples, so
     /// - 16 bit samples map [-32768, 32767] -> [-1, 1]
     /// - 24 bit samples map [-16777216, 16777215] -> [-1, 1]
-    fn get_samples_norm<T: SampleNormalizedConvert>(
+    pub fn get_samples_norm<T: SampleNormalizedConvert>(
         &mut self,
         target: &mut [Complex<T>],
     ) -> Result<usize, ReadError> {
@@ -679,11 +680,70 @@ mod tests {
     }
 
     #[test]
-    fn read_16bit_file() {
-        let file = File::open("test_files/16_bit.sdriq").unwrap();
-        let source = Source::new(file);
+    fn testsignal_constant_header() {
+        let file = File::open("test_files/constant.sdriq").unwrap();
+        let source = Source::new(file).unwrap();
+        let header = source.get_header();
+        assert_eq!(header.samp_rate, 768000);
+        assert_eq!(header.center_freq, 123456000);
+        assert_eq!(header.start_timestamp, 1759607614307);
+        assert_eq!(header.samp_size, 24);
     }
 
     #[test]
-    fn read_24bit_file() {}
+    fn testsignal_constant_get_samples() {
+        let file = File::open("test_files/constant.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+
+        let mut samples: [Complex<i32>; 8] = Default::default();
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 8);
+
+        for v in samples {
+            assert_eq!(v, Complex::<i32> { re: 65536, im: 0 });
+        }
+
+        // Try to read past EOF, it should write no samples
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 0);
+    }
+
+    #[test]
+    fn testsignal_constant_partial_read() {
+        let file = File::open("test_files/constant.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+
+        let mut samples: [Complex<i32>; 4] = Default::default();
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 4);
+
+        for v in samples {
+            assert_eq!(v, Complex::<i32> { re: 65536, im: 0 });
+        }
+
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 4);
+
+        for v in samples {
+            assert_eq!(v, Complex::<i32> { re: 65536, im: 0 });
+        }
+
+        // Try to read past EOF, it should write no samples
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 0);
+    }
+
+    #[test]
+    fn testsignal_constant_excessive_read() {
+        let file = File::open("test_files/constant.sdriq").unwrap();
+        let mut source = Source::new(file).unwrap();
+
+        let mut samples: [Complex<i32>; 10] = Default::default();
+        let num = source.get_samples(&mut samples).unwrap();
+        assert_eq!(num, 8);
+
+        for &v in samples[0..num].iter() {
+            assert_eq!(v, Complex::<i32> { re: 65536, im: 0 });
+        }
+    }
 }
