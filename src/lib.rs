@@ -1116,7 +1116,37 @@ mod tests {
             assert_eq!(i as f64, f64::from_i16(i).unwrap());
             assert_eq!(i as f32, f32::from_i16(i).unwrap());
             assert_eq!(i as f64, f64::from_i16(i).unwrap());
+
+            assert_eq!(i, i.to_i16().unwrap());
+            assert_eq!(i, (i as i32).to_i16().unwrap());
+            assert_eq!(i, (i as f32).to_i16().unwrap());
+            assert_eq!(i, (i as f64).to_i16().unwrap());
         }
+
+        let big_positive = I24_MAX + 1233;
+        let big_negative = I24_MIN - 5415;
+
+        assert!(big_positive.to_i16().is_none());
+        assert!((big_positive as f32).to_i16().is_none());
+        assert!((big_positive as f64).to_i16().is_none());
+        assert!(big_negative.to_i16().is_none());
+        assert!((big_negative as f32).to_i16().is_none());
+        assert!((big_negative as f64).to_i16().is_none());
+        assert_eq!(big_positive.to_i16_clamp(), i16::MAX);
+        assert_eq!((big_positive as f32).to_i16_clamp(), i16::MAX);
+        assert_eq!((big_positive as f64).to_i16_clamp(), i16::MAX);
+        assert_eq!(big_negative.to_i16_clamp(), i16::MIN);
+        assert_eq!((big_negative as f32).to_i16_clamp(), i16::MIN);
+        assert_eq!((big_negative as f64).to_i16_clamp(), i16::MIN);
+
+        assert!(f32::INFINITY.to_i16().is_none());
+        assert_eq!(f32::INFINITY.to_i16_clamp(), i16::MAX);
+        assert!(f32::NEG_INFINITY.to_i16().is_none());
+        assert_eq!(f32::NEG_INFINITY.to_i16_clamp(), i16::MIN);
+        assert!(f64::INFINITY.to_i16().is_none());
+        assert_eq!(f64::INFINITY.to_i16_clamp(), i16::MAX);
+        assert!(f64::NEG_INFINITY.to_i16().is_none());
+        assert_eq!(f64::NEG_INFINITY.to_i16_clamp(), i16::MIN);
     }
 
     #[test]
@@ -1130,6 +1160,11 @@ mod tests {
             assert_eq!(i as f64, f64::from_i24(i).unwrap());
             assert_eq!(i as f32, f32::from_i24(i).unwrap());
             assert_eq!(i as f64, f64::from_i24(i).unwrap());
+
+            assert_eq!(i, i.to_i24().unwrap());
+            assert_eq!(i, (i as i32).to_i24().unwrap());
+            assert_eq!(i, (i as f32).to_i24().unwrap());
+            assert_eq!(i, (i as f64).to_i24().unwrap());
         }
 
         // Not all 24 bit values are representable by i16, but they are correctly clipped
@@ -1137,6 +1172,13 @@ mod tests {
             let i_clamp = i16::from_i24_clamp(i);
             if i_clamp as i32 != i {
                 assert!(i16::from_i24(i).is_none());
+                assert!(i.to_i16().is_none());
+                assert!((i as f32).to_i16().is_none());
+                assert!((i as f64).to_i16().is_none());
+                assert_eq!(i, i.to_i24().unwrap());
+                assert_eq!(i, (i as f32).to_i24().unwrap());
+                assert_eq!(i, (i as f64).to_i24().unwrap());
+
                 if i < 0 {
                     assert!(i_clamp == i16::MIN);
                 } else {
@@ -1153,6 +1195,35 @@ mod tests {
             assert_eq!(i as f32, f32::from_i24(i).unwrap());
             assert_eq!(i as f64, f64::from_i24(i).unwrap());
         }
+
+        // (Not feasible to test all 32 bit values, we check just a few)
+        let big_positive = I24_MAX + 1233;
+        let big_negative = I24_MIN - 5415;
+
+        assert!(big_positive.to_i24().is_none());
+        assert!((big_positive as f32).to_i24().is_none());
+        assert!((big_positive as f64).to_i24().is_none());
+
+        assert!(big_negative.to_i24().is_none());
+        assert!((big_negative as f32).to_i24().is_none());
+        assert!((big_negative as f64).to_i24().is_none());
+
+        assert_eq!(big_positive.to_i24_clamp(), I24_MAX);
+        assert_eq!((big_positive as f32).to_i24_clamp(), I24_MAX);
+        assert_eq!((big_positive as f64).to_i24_clamp(), I24_MAX);
+
+        assert_eq!(big_negative.to_i24_clamp(), I24_MIN);
+        assert_eq!((big_negative as f32).to_i24_clamp(), I24_MIN);
+        assert_eq!((big_negative as f64).to_i24_clamp(), I24_MIN);
+
+        assert!(f32::INFINITY.to_i24().is_none());
+        assert_eq!(f32::INFINITY.to_i24_clamp(), I24_MAX);
+        assert!(f32::NEG_INFINITY.to_i24().is_none());
+        assert_eq!(f32::NEG_INFINITY.to_i24_clamp(), I24_MIN);
+        assert!(f64::INFINITY.to_i24().is_none());
+        assert_eq!(f64::INFINITY.to_i24_clamp(), I24_MAX);
+        assert!(f64::NEG_INFINITY.to_i24().is_none());
+        assert_eq!(f64::NEG_INFINITY.to_i24_clamp(), I24_MIN);
     }
 
     #[test]
