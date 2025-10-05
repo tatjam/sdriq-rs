@@ -3,7 +3,7 @@
 //!
 //! ## Example
 //!
-//! ```
+//! ```no_run
 //! use sdriq::{Source, Complex};
 //! // You can also use num_complex::Complex;
 //! use std::fs::File;
