@@ -25,7 +25,6 @@
 //! ## Development state
 //!
 //! **Not yet implemented**:
-//! - Writing files (Sink)
 //! - Benchmarking and performance tuning
 //!
 //! **Not yet tested**:
@@ -55,10 +54,17 @@ pub enum ReadError {
     #[error("Reading sample would truncate")]
     TruncationError(),
 }
-pub enum WriteError {}
+
+#[derive(Error, Debug)]
+pub enum WriteError {
+    #[error("I/O error")]
+    IOError(#[from] std::io::Error),
+    #[error("Header sample size is invalid value {samp_size:?}")]
+    HeaderSampleSizeInvalid { samp_size: u32 },
+}
 
 /// Header content of the .sdriq file
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub struct Header {
     /// Sample rate in samples per second
     pub samp_rate: u32,
@@ -71,8 +77,29 @@ pub struct Header {
 }
 
 impl Header {
+    /// Writes the header to the writer, returning the number of bytes written.
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<usize, WriteError> {
+        if self.samp_size != 16 && self.samp_size != 24 {
+            return Err(WriteError::HeaderSampleSizeInvalid {
+                samp_size: self.samp_size,
+            });
+        }
+
+        let mut header_buf: [u8; 32] = [0; 32];
+        header_buf[0..4].copy_from_slice(self.samp_rate.to_le_bytes().as_slice());
+        header_buf[4..12].copy_from_slice(self.center_freq.to_le_bytes().as_slice());
+        header_buf[12..20].copy_from_slice(self.start_timestamp.to_le_bytes().as_slice());
+        header_buf[20..24].copy_from_slice(self.samp_size.to_le_bytes().as_slice());
+        // 4 bytes of padding, left as 0
+        let crc32_computed = crc32fast::hash(&header_buf[0..28]);
+        header_buf[28..32].copy_from_slice(crc32_computed.to_le_bytes().as_slice());
+
+        writer.write_all(&header_buf)?;
+        Ok(header_buf.len())
+    }
+
     /// Read a header as stored in a binary, from the given reader.
-    pub fn new<R: Read>(reader: &mut R) -> Result<Self, ReadError> {
+    pub fn read_from<R: Read>(reader: &mut R) -> Result<Self, ReadError> {
         let mut header_bytes: [u8; 32] = [0; 32];
         let num_read = reader.read(&mut header_bytes)?;
         if num_read < 32 {
@@ -296,7 +323,7 @@ impl<R: Read> Source<R> {
     /// `bytes` represents the internal buffer size, which should be chosen to reduce I/O overhead.
     pub fn with_capacity(bytes: usize, source: R) -> Result<Self, ReadError> {
         let mut reader = BufReader::with_capacity(bytes, source);
-        let header = Header::new(&mut reader)?;
+        let header = Header::read_from(&mut reader)?;
         Ok(Self { header, reader })
     }
 
@@ -401,7 +428,7 @@ impl<R: Read> Source<R> {
     /// Note that the resulting floating point numbers are NOT normalized!
     ///
     /// Note that this function will choose the most optimized possible call for the type `T`, so if you have
-    /// `T = i32` or `T = i16`, it will automatically call [Sources::get_samples_direct] on little endian systems.
+    /// `T = i32` or `T = i16`, it will automatically call [Source::get_samples_direct] on little endian systems.
     ///
     /// Returns the number of samples read.
     pub fn get_samples<T: SampleConvert + 'static>(
@@ -650,14 +677,42 @@ impl<R: Read> Source<R> {
 }
 
 /// A Sink wraps around a Write to be able to write samples to an sdriq file.
-struct Sink<W: Write> {
+pub struct Sink<W: Write> {
     writer: BufWriter<W>,
     header: Header,
+}
+
+impl<W: Write> Sink<W> {
+    /// Creates a sample writer from the given writer and header.
+    /// Uses a sane-default for the internal buffer size, which should perform acceptably on most use cases.
+    pub fn new(writer: W, header: Header) -> Result<Self, WriteError> {
+        // Default buffer size holds a bit over 1sec of 1Msps 16 bit samples, rounded to nearest power of 2
+        Self::with_capacity(2097152, writer, header)
+    }
+
+    /// Creates a sample writer from the given writer and header.
+    /// `bytes` represents the internal buffer size, which should be chosen to reduce I/O overhead.
+    pub fn with_capacity(bytes: usize, mut writer: W, header: Header) -> Result<Self, WriteError> {
+        // Write the header, non-buffered
+        header.write_to(&mut writer)?;
+        let writer_buf = BufWriter::with_capacity(bytes, writer);
+        Ok(Self {
+            header,
+            writer: writer_buf,
+        })
+    }
+
+    /// Flushes the internal buffer. If you rely on `Drop` calling flush, any I/O errors will be silently
+    /// ignored, so it's important to use this function! See [std::io::BufWriter] documentation.
+    pub fn flush(&mut self) -> Result<(), std::io::Error> {
+        self.writer.flush()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs::File;
+    use std::io::Cursor;
 
     use super::*;
     use num::Signed;
@@ -1041,9 +1096,26 @@ mod tests {
     #[should_panic]
     fn header_not_verify_crc() {
         let file = File::open("test_files/malformed.sdriq").unwrap();
-        let mut source = Source::new(file).unwrap();
+        let _ = Source::new(file).unwrap();
     }
 
     #[test]
-    fn test() {}
+    fn header_write_and_read() {
+        let header = Header {
+            samp_rate: 12345,
+            center_freq: 67890,
+            start_timestamp: 12345,
+            samp_size: 24,
+        };
+
+        let mut buffer: Vec<u8> = Vec::new();
+        header.write_to(&mut buffer).unwrap();
+
+        assert_eq!(buffer.len(), 32);
+
+        let mut as_slice = buffer.as_slice();
+        let read_header = Header::read_from(&mut as_slice).unwrap();
+
+        assert_eq!(read_header, header);
+    }
 }
