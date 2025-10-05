@@ -4,8 +4,8 @@
 //! ## Example
 //!
 //! ```
-//! use sdriq::Source;
-//! use num_complex::Complex;
+//! use sdriq::{Source, Complex};
+//! // You can also use num_complex::Complex;
 //! use std::fs::File;
 //!
 //! let file = File::open("file.sdriq").unwrap();
@@ -38,7 +38,7 @@ use std::{
 };
 use thiserror::Error;
 
-use num_complex::Complex;
+pub use num_complex::Complex;
 
 #[derive(Error, Debug)]
 pub enum ReadError {
