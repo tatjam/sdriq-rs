@@ -34,6 +34,7 @@
 use std::{
     any::TypeId,
     io::{BufRead, BufReader, BufWriter, Read, Write},
+    ptr::slice_from_raw_parts,
 };
 use thiserror::Error;
 
@@ -61,6 +62,10 @@ pub enum WriteError {
     IOError(#[from] std::io::Error),
     #[error("Header sample size is invalid value {samp_size:?}")]
     HeaderSampleSizeInvalid { samp_size: u32 },
+    #[error("Sample size stored in the file is not compatible with source type")]
+    InvalidSampleSize(),
+    #[error("Writing sample would truncate")]
+    TruncationError(),
 }
 
 /// Header content of the .sdriq file
@@ -187,6 +192,14 @@ pub trait SampleConvert: Copy + Sized {
     fn from_i16_clamp(value: i16) -> Self;
     /// Read a sample, clamping if needed, from a 24-bit value (stored as 32 bit)
     fn from_i24_clamp(value: i32) -> Self;
+    /// Write a 16-bit sample, if possible without truncation, from the value
+    fn to_i16(self) -> Option<i16>;
+    /// Write a 24-bit sample, if possible without truncation, from the value
+    fn to_i24(self) -> Option<i32>;
+    /// Write a 16-bit sample, clamping if needed, from the value
+    fn to_i16_clamp(self) -> i16;
+    /// Write a 24-bit sample, clamping if needed, from the value
+    fn to_i24_clamp(self) -> i32;
 }
 
 impl SampleConvert for i16 {
@@ -204,6 +217,22 @@ impl SampleConvert for i16 {
 
     fn from_i24_clamp(value: i32) -> Self {
         value.clamp(i16::MIN as i32, i16::MAX as i32) as Self
+    }
+
+    fn to_i16(self) -> Option<i16> {
+        Some(self)
+    }
+
+    fn to_i24(self) -> Option<i32> {
+        Some(self as i32)
+    }
+
+    fn to_i16_clamp(self) -> i16 {
+        self
+    }
+
+    fn to_i24_clamp(self) -> i32 {
+        self as i32
     }
 }
 
@@ -223,8 +252,25 @@ impl SampleConvert for i32 {
     fn from_i24_clamp(value: i32) -> Self {
         value as Self
     }
+
+    fn to_i16(self) -> Option<i16> {
+        i16::try_from(self).ok()
+    }
+
+    fn to_i24(self) -> Option<i32> {
+        if !is_24bit(self) { None } else { Some(self) }
+    }
+
+    fn to_i16_clamp(self) -> i16 {
+        (self).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+    }
+
+    fn to_i24_clamp(self) -> i32 {
+        (self).clamp(I24_MIN, I24_MAX)
+    }
 }
 
+/// Note that decimal truncation is done if converting to i16 or i24, instead of rounding
 impl SampleConvert for f32 {
     fn from_i16(value: i16) -> Option<Self> {
         Some(value as f32)
@@ -243,6 +289,52 @@ impl SampleConvert for f32 {
     fn from_i24_clamp(value: i32) -> Self {
         value as Self
     }
+
+    fn to_i16(self) -> Option<i16> {
+        debug_assert!(!self.is_nan());
+        if self.is_infinite() {
+            return None;
+        }
+        if self < i16::MIN as f32 || self > i16::MAX as f32 {
+            return None;
+        }
+
+        Some(self as i16)
+    }
+
+    fn to_i24(self) -> Option<i32> {
+        debug_assert!(!self.is_nan());
+        if self.is_infinite() {
+            return None;
+        }
+        if self < I24_MIN as f32 || self > I24_MAX as f32 {
+            return None;
+        }
+
+        Some(self as i32)
+    }
+
+    fn to_i16_clamp(self) -> i16 {
+        debug_assert!(!self.is_nan());
+        if self < i16::MIN as f32 {
+            i16::MIN
+        } else if self > i16::MAX as f32 {
+            i16::MAX
+        } else {
+            self as i16
+        }
+    }
+
+    fn to_i24_clamp(self) -> i32 {
+        debug_assert!(!self.is_nan());
+        if self < I24_MIN as f32 {
+            I24_MIN
+        } else if self > I24_MAX as f32 {
+            I24_MAX
+        } else {
+            self as i32
+        }
+    }
 }
 
 impl SampleConvert for f64 {
@@ -260,6 +352,52 @@ impl SampleConvert for f64 {
 
     fn from_i24_clamp(value: i32) -> Self {
         value as Self
+    }
+
+    fn to_i16(self) -> Option<i16> {
+        debug_assert!(!self.is_nan());
+        if self.is_infinite() {
+            return None;
+        }
+        if self < i16::MIN as f64 || self > i16::MAX as f64 {
+            return None;
+        }
+
+        Some(self as i16)
+    }
+
+    fn to_i24(self) -> Option<i32> {
+        debug_assert!(!self.is_nan());
+        if self.is_infinite() {
+            return None;
+        }
+        if self < I24_MIN as f64 || self > I24_MAX as f64 {
+            return None;
+        }
+
+        Some(self as i32)
+    }
+
+    fn to_i16_clamp(self) -> i16 {
+        debug_assert!(!self.is_nan());
+        if self < i16::MIN as f64 {
+            i16::MIN
+        } else if self > i16::MAX as f64 {
+            i16::MAX
+        } else {
+            self as i16
+        }
+    }
+
+    fn to_i24_clamp(self) -> i32 {
+        debug_assert!(!self.is_nan());
+        if self < I24_MIN as f64 {
+            I24_MIN
+        } else if self > I24_MAX as f64 {
+            I24_MAX
+        } else {
+            self as i32
+        }
     }
 }
 
@@ -285,8 +423,8 @@ const I24_SCALE_F64: f64 = 1.0 / F64_SCALE_I24;
 pub trait SampleNormalizedConvert: Copy + Sized {
     fn from_i16_norm(value: i16) -> Self;
     fn from_i24_norm(value: i32) -> Self;
-    fn to_i16_denorm(value: &Self) -> i16;
-    fn to_i24_denorm(value: &Self) -> i32;
+    fn to_i16_denorm(&self) -> i16;
+    fn to_i24_denorm(&self) -> i32;
 }
 
 impl SampleNormalizedConvert for f32 {
@@ -300,14 +438,14 @@ impl SampleNormalizedConvert for f32 {
         (value as f32) * I24_SCALE_F32
     }
 
-    fn to_i16_denorm(value: &Self) -> i16 {
-        let denorm = value * F32_SCALE_I16;
+    fn to_i16_denorm(&self) -> i16 {
+        let denorm = *self * F32_SCALE_I16;
         debug_assert!(i16::MIN as f32 <= denorm && denorm <= i16::MAX as f32);
         denorm as i16
     }
 
-    fn to_i24_denorm(value: &Self) -> i32 {
-        let denorm = value * F32_SCALE_I24;
+    fn to_i24_denorm(&self) -> i32 {
+        let denorm = *self * F32_SCALE_I24;
         debug_assert!(I24_MIN as f32 <= denorm && denorm <= I24_MAX as f32);
         denorm as i32
     }
@@ -324,14 +462,14 @@ impl SampleNormalizedConvert for f64 {
         (value as f64) * I24_SCALE_F64
     }
 
-    fn to_i16_denorm(value: &Self) -> i16 {
-        let denorm = value * F64_SCALE_I16;
+    fn to_i16_denorm(&self) -> i16 {
+        let denorm = *self * F64_SCALE_I16;
         debug_assert!(i16::MIN as f64 <= denorm && denorm <= i16::MAX as f64);
         denorm as i16
     }
 
-    fn to_i24_denorm(value: &Self) -> i32 {
-        let denorm = value * F64_SCALE_I24;
+    fn to_i24_denorm(&self) -> i32 {
+        let denorm = *self * F64_SCALE_I24;
         debug_assert!(I24_MIN as f64 <= denorm && denorm <= I24_MAX as f64);
         denorm as i32
     }
@@ -709,6 +847,12 @@ impl<R: Read> Source<R> {
 }
 
 /// A Sink wraps around a Write to be able to write samples to an sdriq file.
+/// Because the number of bytes written does not directly map to the number of samples written,
+/// in order to prevent "half-samples" being written, write_all is used at all times, and all
+/// operations either write the full passed buffer, or fail.
+///
+/// It's important to use [Sink::flush] instead of relying on Drop flushing the buffer, as otherwise
+/// any I/O errors will be silently ignored.
 pub struct Sink<W: Write> {
     writer: BufWriter<W>,
     header: Header,
@@ -740,6 +884,90 @@ impl<W: Write> Sink<W> {
         self.writer.flush()
     }
 
+    #[inline]
+    #[doc(hidden)]
+    fn write_next_sample_16bit<T: SampleConvert>(
+        &mut self,
+        sample: Complex<T>,
+    ) -> Result<(), WriteError> {
+        let i = sample.re.to_i16().ok_or(WriteError::TruncationError())?;
+        let q = sample.im.to_i16().ok_or(WriteError::TruncationError())?;
+        self.writer.write_all(i.to_le_bytes().as_slice())?;
+        self.writer.write_all(q.to_le_bytes().as_slice())?;
+
+        Ok(())
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn write_next_sample_24bit<T: SampleConvert>(
+        &mut self,
+        sample: Complex<T>,
+    ) -> Result<(), WriteError> {
+        let i = sample.re.to_i24().ok_or(WriteError::TruncationError())?;
+        let q = sample.im.to_i24().ok_or(WriteError::TruncationError())?;
+        self.writer.write_all(i.to_le_bytes().as_slice())?;
+        self.writer.write_all(q.to_le_bytes().as_slice())?;
+
+        Ok(())
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn write_next_sample_16bit_clamp<T: SampleConvert>(
+        &mut self,
+        sample: Complex<T>,
+    ) -> Result<(), WriteError> {
+        let i = sample.re.to_i16_clamp();
+        let q = sample.im.to_i16_clamp();
+        self.writer.write_all(i.to_le_bytes().as_slice())?;
+        self.writer.write_all(q.to_le_bytes().as_slice())?;
+
+        Ok(())
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn write_next_sample_24bit_clamp<T: SampleConvert>(
+        &mut self,
+        sample: Complex<T>,
+    ) -> Result<(), WriteError> {
+        let i = sample.re.to_i24_clamp();
+        let q = sample.im.to_i24_clamp();
+        self.writer.write_all(i.to_le_bytes().as_slice())?;
+        self.writer.write_all(q.to_le_bytes().as_slice())?;
+
+        Ok(())
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn write_next_sample_16bit_denorm<T: SampleNormalizedConvert>(
+        &mut self,
+        sample: Complex<T>,
+    ) -> Result<(), WriteError> {
+        let i = sample.re.to_i16_denorm();
+        let q = sample.im.to_i16_denorm();
+        self.writer.write_all(i.to_le_bytes().as_slice())?;
+        self.writer.write_all(q.to_le_bytes().as_slice())?;
+
+        Ok(())
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    fn write_next_sample_24bit_denorm<T: SampleNormalizedConvert>(
+        &mut self,
+        sample: Complex<T>,
+    ) -> Result<(), WriteError> {
+        let i = sample.re.to_i24_denorm();
+        let q = sample.im.to_i24_denorm();
+        self.writer.write_all(i.to_le_bytes().as_slice())?;
+        self.writer.write_all(q.to_le_bytes().as_slice())?;
+
+        Ok(())
+    }
+
     /// Read samples, with possible conversion if type `Complex<T>` does not match the type
     /// stored in the sdriq file. This could have slight overhead.
     /// If the conversion would result in clamping (for example, 24 bits -> i16), an error is generated,
@@ -751,7 +979,8 @@ impl<W: Write> Sink<W> {
     /// `T = i32` or `T = i16`, it will automatically call [Sink::write_samples_direct] on little endian systems.
     ///
     /// Returns the number of complex samples written.
-    pub fn write_samples<T: SampleConvert>(samples: &[Complex<T>]) -> Result<usize, WriteError> {
+    pub fn write_all_samples<T: SampleConvert>(samples: &[Complex<T>]) -> Result<(), WriteError> {
+        let mut num_written = 0;
         todo!("Implement");
     }
 
@@ -761,19 +990,69 @@ impl<W: Write> Sink<W> {
     /// **NOTE**: On big endian systems, the direct copy is not done, and instead "slow" loading is performed
     ///
     /// **NOTE**: No range-checking is done for 32-bit -> 24-bit storage, if any out of bound values are used,
-    /// they will be stored in the binary file as is, and may cause issues on users of the generated file.
+    /// they will be stored in the binary file as is, and may cause issues on users of the generated file. Note that
+    /// this is possible because 24-bit values are stored in the .sdriq file with 32-bit alignment.
     ///
     /// Returns the number of complex samples written.
-    pub fn write_samples_direct<T: SampleConvert>(
+    pub fn write_all_samples_direct<T: SampleConvert + 'static>(
+        &mut self,
         samples: &[Complex<T>],
-    ) -> Result<usize, WriteError> {
-        todo!("Implement");
+    ) -> Result<(), WriteError> {
+        let header_bits = self.header.get_stored_bits_per_sample();
+        match header_bits {
+            32 => {
+                if TypeId::of::<T>() != TypeId::of::<i32>() {
+                    return Err(WriteError::InvalidSampleSize());
+                }
+            }
+            16 => {
+                if TypeId::of::<T>() != TypeId::of::<i16>() {
+                    return Err(WriteError::InvalidSampleSize());
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            // Fall-back to slow writing
+            return self.write_all_samples::<T>(samples);
+        }
+
+        #[cfg(target_endian = "little")]
+        {
+            self.write_all_samples_memcpy::<T>(samples)
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn write_all_samples_memcpy<T: SampleConvert>(
+        &mut self,
+        samples: &[Complex<T>],
+    ) -> Result<(), WriteError> {
+        let header_bits = self.header.get_stored_bits_per_sample();
+        let incoming_bits = std::mem::size_of::<T>() * 8;
+        if header_bits != incoming_bits {
+            return Err(WriteError::InvalidSampleSize());
+        }
+
+        let num_bytes = samples.len() * std::mem::size_of::<Complex<T>>();
+        let raw_slice = slice_from_raw_parts(samples.as_ptr() as *const u8, num_bytes);
+        unsafe {
+            // SAFETY:
+            // - If we have Complex<i16>, then it's directly binary-compatible
+            // - If we have Complex<i32>, it's directly binary-compatible, with the caveat that
+            //   no size checking is done to make sure the i32 are actually i24.
+            self.writer.write_all(&*raw_slice)?;
+        };
+
+        Ok(())
     }
 
     /// Read samples, denormalizing them. See [SampleNormalizedConvert].
-    pub fn write_samples_denorm<T: SampleNormalizedConvert>(
+    pub fn write_all_samples_denorm<T: SampleNormalizedConvert>(
         samples: &[Complex<T>],
-    ) -> Result<usize, WriteError> {
+    ) -> Result<(), WriteError> {
         todo!("Implement");
     }
 
@@ -785,9 +1064,9 @@ impl<W: Write> Sink<W> {
     /// in [Sink::get_samples].
     ///
     /// Returns the number of samples written.
-    pub fn write_samples_clamp<T: SampleConvert>(
+    pub fn write_all_samples_clamp<T: SampleConvert>(
         samples: &[Complex<T>],
-    ) -> Result<usize, WriteError> {
+    ) -> Result<(), WriteError> {
         todo!("Implement");
     }
 }
@@ -1033,6 +1312,22 @@ mod tests {
 
         fn from_i24_clamp(value: i32) -> Self {
             Self { v: value as i32 }
+        }
+
+        fn to_i16(self) -> Option<i16> {
+            i32::to_i16(self.v)
+        }
+
+        fn to_i24(self) -> Option<i32> {
+            i32::to_i24(self.v)
+        }
+
+        fn to_i16_clamp(self) -> i16 {
+            i32::to_i16_clamp(self.v)
+        }
+
+        fn to_i24_clamp(self) -> i32 {
+            i32::to_i24_clamp(self.v)
         }
     }
 
