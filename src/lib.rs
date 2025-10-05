@@ -1046,7 +1046,7 @@ impl<W: Write> Sink<W> {
             return Err(WriteError::InvalidSampleSize());
         }
 
-        let num_bytes = samples.len() * std::mem::size_of::<Complex<T>>();
+        let num_bytes = std::mem::size_of_val(samples);
         let raw_slice = slice_from_raw_parts(samples.as_ptr() as *const u8, num_bytes);
         unsafe {
             // SAFETY:
@@ -1102,11 +1102,9 @@ impl<W: Write> Sink<W> {
 #[cfg(test)]
 mod tests {
     use std::fs::File;
-    use std::io::Cursor;
 
     use super::*;
     use num::Signed;
-    use num_complex::ComplexFloat;
 
     #[test]
     fn test_conversion_16bit() {
@@ -1339,7 +1337,7 @@ mod tests {
         }
 
         fn from_i24_clamp(value: i32) -> Self {
-            Self { v: value as i32 }
+            Self { v: value }
         }
 
         fn to_i16(self) -> Option<i16> {
