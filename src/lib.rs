@@ -57,6 +57,7 @@ pub enum ReadError {
 }
 pub enum WriteError {}
 
+/// Header content of the .sdriq file
 #[derive(Copy, Clone, PartialEq)]
 pub struct Header {
     /// Sample rate in samples per second
@@ -70,6 +71,7 @@ pub struct Header {
 }
 
 impl Header {
+    /// Read a header as stored in a binary, from the given reader.
     pub fn new<R: Read>(reader: &mut R) -> Result<Self, ReadError> {
         let mut header_bytes: [u8; 32] = [0; 32];
         let num_read = reader.read(&mut header_bytes)?;
@@ -130,7 +132,8 @@ impl Header {
         })
     }
 
-    /// Returns the number of
+    /// Returns the number of bits that each sample takes up in the binary file,
+    /// not neccesarily equal to `samp_size`.
     pub fn get_stored_bits_per_sample(&self) -> usize {
         match self.samp_size {
             16 => 16,
@@ -146,10 +149,16 @@ fn is_24bit(value: i32) -> bool {
     (value << 8) >> 8 == value
 }
 
+/// If you want to read samples to a type with conversion, this trait must be implemented
+/// for said type.
 pub trait SampleConvert: Copy + Sized {
+    /// Read a sample, if possible without truncation, from a 16-bit value
     fn from_i16(value: i16) -> Option<Self>;
+    /// Read a sample, if possible without truncation, from a 24-bit value (stored as 32 bit)
     fn from_i24(value: i32) -> Option<Self>;
+    /// Read a sample, clamping if needed, from a 16-bit value
     fn from_i16_clamp(value: i16) -> Self;
+    /// Read a sample, clamping if needed, from a 24-bit value (stored as 32 bit)
     fn from_i24_clamp(value: i32) -> Self;
 }
 
@@ -232,8 +241,12 @@ const I32_SCALE_F32: f32 = 1.0 / 8388608.0;
 const I16_SCALE_F64: f64 = 1.0 / 32768.0;
 const I32_SCALE_F64: f64 = 1.0 / 8388608.0;
 
-/// For 16 bit numbers, maps [-32768, 32767] -> [-1, 0.9999694824]
-/// For 24 bit numbers, maps [-8388608, 8388607] -> [-1, 0.9999998808]
+/// This trait must be implemented for your target type if you want to be able to perform "normalized" sample reads.
+///
+/// The implementations of this trait included in this crate use the following logic:
+/// - For 16 bit numbers, maps [-32768, 32767] -> [-1, 0.9999694824]
+/// - For 24 bit numbers, maps [-8388608, 8388607] -> [-1, 0.9999998808]
+///
 /// This guarantees 0 is mapped to 0. The error introduced is insignificant for almost any use, but be aware that
 /// the returned values will always be contained in the interval [-1, 1).
 pub trait SampleNormalizedConvert: Copy + Sized {
@@ -265,9 +278,7 @@ impl SampleNormalizedConvert for f64 {
     }
 }
 
-/// A Source wraps around a Read to be able to fetch samples from an sdriq file. Samples are obtained by
-/// copying into an array of Complex values, optionally performing type conversion (at a slight
-/// performance cost, of course!).
+/// A Source wraps around a Read to be able to fetch samples from an sdriq file.
 pub struct Source<R: Read> {
     header: Header,
     reader: BufReader<R>,
@@ -282,13 +293,14 @@ impl<R: Read> Source<R> {
     }
 
     /// Creates a sample reader, expecting to find a valid header on the first few bytes of the Read argument.
+    /// `bytes` represents the internal buffer size, which should be chosen to reduce I/O overhead.
     pub fn with_capacity(bytes: usize, source: R) -> Result<Self, ReadError> {
         let mut reader = BufReader::with_capacity(bytes, source);
         let header = Header::new(&mut reader)?;
         Ok(Self { header, reader })
     }
 
-    /// Returns the header applicable to this Source
+    /// Returns the header applicable to this `Source`
     pub fn get_header(&self) -> Header {
         self.header
     }
@@ -346,7 +358,7 @@ impl<R: Read> Source<R> {
     /// Reads samples, as long as they are directly copyable to `Complex<T>` type without any
     /// conversion being performed. This is fast, as it's a simple, flat memory copy.
     ///
-    /// WARNING: On big endian systems, the driect copy is not done, and instead "slow" loading is performed
+    /// **NOTE**: On big endian systems, the driect copy is not done, and instead "slow" loading is performed
     ///
     /// Returns the number of complex samples read.
     pub fn get_samples_direct<T: 'static>(
@@ -388,7 +400,8 @@ impl<R: Read> Source<R> {
     /// fit into f32.
     /// Note that the resulting floating point numbers are NOT normalized!
     ///
-    /// Note that this function will choose the most optimized possible call for the type "T"
+    /// Note that this function will choose the most optimized possible call for the type `T`, so if you have
+    /// `T = i32` or `T = i16`, it will automatically call [Sources::get_samples_direct] on little endian systems.
     ///
     /// Returns the number of samples read.
     pub fn get_samples<T: SampleConvert + 'static>(
@@ -396,12 +409,15 @@ impl<R: Read> Source<R> {
         target: &mut [Complex<T>],
     ) -> Result<usize, ReadError> {
         // Try optimized functions if possible
-        let header_bits = self.header.get_stored_bits_per_sample();
-        if TypeId::of::<T>() == TypeId::of::<i32>() && header_bits == 32 {
-            return self.get_samples_direct(target);
-        }
-        if TypeId::of::<T>() == TypeId::of::<i16>() && header_bits == 16 {
-            return self.get_samples_direct(target);
+        #[cfg(target_endian = "little")]
+        {
+            let header_bits = self.header.get_stored_bits_per_sample();
+            if TypeId::of::<T>() == TypeId::of::<i32>() && header_bits == 32 {
+                return self.get_samples_direct(target);
+            }
+            if TypeId::of::<T>() == TypeId::of::<i16>() && header_bits == 16 {
+                return self.get_samples_direct(target);
+            }
         }
 
         // Fallback "slow" method
@@ -568,7 +584,8 @@ impl<R: Read> Source<R> {
     /// from the sdriq file. This could have slight overhead.
     /// If T is too small (i16) and the incoming number if bigger, it will be clamped.
     ///
-    /// Note that this function will choose the most optimized possible call for the type "T"
+    /// Note that this function will choose the most optimized possible call for the type "T", as explained
+    /// in [Source::get_samples].
     ///
     /// Returns the number of samples read.
     pub fn get_samples_clamp<T: SampleConvert + 'static>(
@@ -576,12 +593,15 @@ impl<R: Read> Source<R> {
         target: &mut [Complex<T>],
     ) -> Result<usize, ReadError> {
         // Try optimized functions if possible
-        let header_bits = self.header.get_stored_bits_per_sample();
-        if TypeId::of::<T>() == TypeId::of::<i32>() && header_bits == 32 {
-            return self.get_samples_direct(target);
-        }
-        if TypeId::of::<T>() == TypeId::of::<i16>() && header_bits == 16 {
-            return self.get_samples_direct(target);
+        #[cfg(target_endian = "little")]
+        {
+            let header_bits = self.header.get_stored_bits_per_sample();
+            if TypeId::of::<T>() == TypeId::of::<i32>() && header_bits == 32 {
+                return self.get_samples_direct(target);
+            }
+            if TypeId::of::<T>() == TypeId::of::<i16>() && header_bits == 16 {
+                return self.get_samples_direct(target);
+            }
         }
 
         // Fallback "slow" method
@@ -604,10 +624,7 @@ impl<R: Read> Source<R> {
         Ok(num_read)
     }
 
-    /// Read samples, normalizing them to [-1, 1] range, so T must be a floating point type (f32 or f64).
-    /// The original range is deduced from the bit-size of the samples, so
-    /// - 16 bit samples map [-32768, 32767] -> [-1, 1]
-    /// - 24 bit samples map [-16777216, 16777215] -> [-1, 1]
+    /// Read samples, normalizing them. See [SampleNormalizedConvert].
     pub fn get_samples_norm<T: SampleNormalizedConvert>(
         &mut self,
         target: &mut [Complex<T>],
@@ -632,9 +649,7 @@ impl<R: Read> Source<R> {
     }
 }
 
-/// A Sink wraps around a Write to be able to write samples to an sdriq file. Samples are written by
-/// copying from an array of Complex values, optionally performing type conversion (at a slight
-/// performance cost, of course!)
+/// A Sink wraps around a Write to be able to write samples to an sdriq file.
 struct Sink<W: Write> {
     writer: BufWriter<W>,
     header: Header,
