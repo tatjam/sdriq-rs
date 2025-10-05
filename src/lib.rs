@@ -385,7 +385,7 @@ impl<R: Read> Source<R> {
     /// Reads samples, as long as they are directly copyable to `Complex<T>` type without any
     /// conversion being performed. This is fast, as it's a simple, flat memory copy.
     ///
-    /// **NOTE**: On big endian systems, the driect copy is not done, and instead "slow" loading is performed
+    /// **NOTE**: On big endian systems, the direct copy is not done, and instead "slow" loading is performed
     ///
     /// Returns the number of complex samples read.
     pub fn get_samples_direct<T: 'static>(
@@ -430,7 +430,7 @@ impl<R: Read> Source<R> {
     /// Note that this function will choose the most optimized possible call for the type `T`, so if you have
     /// `T = i32` or `T = i16`, it will automatically call [Source::get_samples_direct] on little endian systems.
     ///
-    /// Returns the number of samples read.
+    /// Returns the number of complex samples read.
     pub fn get_samples<T: SampleConvert + 'static>(
         &mut self,
         target: &mut [Complex<T>],
