@@ -979,9 +979,19 @@ impl<W: Write> Sink<W> {
     /// `T = i32` or `T = i16`, it will automatically call [Sink::write_samples_direct] on little endian systems.
     ///
     /// Returns the number of complex samples written.
-    pub fn write_all_samples<T: SampleConvert>(samples: &[Complex<T>]) -> Result<(), WriteError> {
-        let mut num_written = 0;
-        todo!("Implement");
+    pub fn write_all_samples<T: SampleConvert>(
+        &mut self,
+        samples: &[Complex<T>],
+    ) -> Result<(), WriteError> {
+        for &samp in samples {
+            match self.header.samp_size {
+                16 => self.write_next_sample_16bit(samp)?,
+                24 => self.write_next_sample_24bit(samp)?,
+                _ => unreachable!(),
+            }
+        }
+
+        Ok(())
     }
 
     /// Writes samples, as long as they are directly copyable to the binary format without any
@@ -1051,9 +1061,18 @@ impl<W: Write> Sink<W> {
 
     /// Read samples, denormalizing them. See [SampleNormalizedConvert].
     pub fn write_all_samples_denorm<T: SampleNormalizedConvert>(
+        &mut self,
         samples: &[Complex<T>],
     ) -> Result<(), WriteError> {
-        todo!("Implement");
+        for &samp in samples {
+            match self.header.samp_size {
+                16 => self.write_next_sample_16bit_denorm(samp)?,
+                24 => self.write_next_sample_24bit_denorm(samp)?,
+                _ => unreachable!(),
+            }
+        }
+
+        Ok(())
     }
 
     /// Read samples, with possible conversion if type `Complex<T>` does not match the binary type
@@ -1065,9 +1084,18 @@ impl<W: Write> Sink<W> {
     ///
     /// Returns the number of samples written.
     pub fn write_all_samples_clamp<T: SampleConvert>(
+        &mut self,
         samples: &[Complex<T>],
     ) -> Result<(), WriteError> {
-        todo!("Implement");
+        for &samp in samples {
+            match self.header.samp_size {
+                16 => self.write_next_sample_16bit_clamp(samp)?,
+                24 => self.write_next_sample_24bit_clamp(samp)?,
+                _ => unreachable!(),
+            }
+        }
+
+        Ok(())
     }
 }
 
