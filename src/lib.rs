@@ -263,22 +263,30 @@ impl SampleConvert for f64 {
     }
 }
 
-const I16_SCALE_F32: f32 = 1.0 / 32768.0;
-const I32_SCALE_F32: f32 = 1.0 / 8388608.0;
-const I16_SCALE_F64: f64 = 1.0 / 32768.0;
-const I32_SCALE_F64: f64 = 1.0 / 8388608.0;
+const I24_MIN: i32 = -8388608;
+const I24_MAX: i32 = 8388607;
+const F64_SCALE_I16: f64 = 32768.0;
+const F64_SCALE_I24: f64 = 8388608.0;
+const F32_SCALE_I16: f32 = 32768.0;
+const F32_SCALE_I24: f32 = 8388608.0;
+const I16_SCALE_F32: f32 = 1.0 / F32_SCALE_I16;
+const I24_SCALE_F32: f32 = 1.0 / F32_SCALE_I24;
+const I16_SCALE_F64: f64 = 1.0 / F64_SCALE_I16;
+const I24_SCALE_F64: f64 = 1.0 / F64_SCALE_I24;
 
 /// This trait must be implemented for your target type if you want to be able to perform "normalized" sample reads.
 ///
 /// The implementations of this trait included in this crate use the following logic:
-/// - For 16 bit numbers, maps [-32768, 32767] -> [-1, 0.9999694824]
-/// - For 24 bit numbers, maps [-8388608, 8388607] -> [-1, 0.9999998808]
+/// - For 16 bit numbers, maps [-32768, 32767] <-> [-1, 0.9999694824]
+/// - For 24 bit numbers, maps [-8388608, 8388607] <-> [-1, 0.9999998808]
 ///
 /// This guarantees 0 is mapped to 0. The error introduced is insignificant for almost any use, but be aware that
 /// the returned values will always be contained in the interval [-1, 1).
 pub trait SampleNormalizedConvert: Copy + Sized {
     fn from_i16_norm(value: i16) -> Self;
     fn from_i24_norm(value: i32) -> Self;
+    fn to_i16_denorm(value: &Self) -> i16;
+    fn to_i24_denorm(value: &Self) -> i32;
 }
 
 impl SampleNormalizedConvert for f32 {
@@ -289,7 +297,19 @@ impl SampleNormalizedConvert for f32 {
     fn from_i24_norm(value: i32) -> Self {
         // This would result in values outside [-1, 1)
         debug_assert!(is_24bit(value), "value was not 24 bit");
-        (value as f32) * I32_SCALE_F32
+        (value as f32) * I24_SCALE_F32
+    }
+
+    fn to_i16_denorm(value: &Self) -> i16 {
+        let denorm = value * F32_SCALE_I16;
+        debug_assert!(i16::MIN as f32 <= denorm && denorm <= i16::MAX as f32);
+        denorm as i16
+    }
+
+    fn to_i24_denorm(value: &Self) -> i32 {
+        let denorm = value * F32_SCALE_I24;
+        debug_assert!(I24_MIN as f32 <= denorm && denorm <= I24_MAX as f32);
+        denorm as i32
     }
 }
 
@@ -301,7 +321,19 @@ impl SampleNormalizedConvert for f64 {
     fn from_i24_norm(value: i32) -> Self {
         // This would result in values outside [-1, 1)
         debug_assert!(is_24bit(value), "value was not 24 bit");
-        (value as f64) * I32_SCALE_F64
+        (value as f64) * I24_SCALE_F64
+    }
+
+    fn to_i16_denorm(value: &Self) -> i16 {
+        let denorm = value * F64_SCALE_I16;
+        debug_assert!(i16::MIN as f64 <= denorm && denorm <= i16::MAX as f64);
+        denorm as i16
+    }
+
+    fn to_i24_denorm(value: &Self) -> i32 {
+        let denorm = value * F64_SCALE_I24;
+        debug_assert!(I24_MIN as f64 <= denorm && denorm <= I24_MAX as f64);
+        denorm as i32
     }
 }
 
@@ -707,6 +739,57 @@ impl<W: Write> Sink<W> {
     pub fn flush(&mut self) -> Result<(), std::io::Error> {
         self.writer.flush()
     }
+
+    /// Read samples, with possible conversion if type `Complex<T>` does not match the type
+    /// stored in the sdriq file. This could have slight overhead.
+    /// If the conversion would result in clamping (for example, 24 bits -> i16), an error is generated,
+    /// but rounding errors for floating point numbers are not reported.
+    ///
+    /// **WARNING**: Floating point numbers are stored as is, without "denormalizing". You likely want [Sink::write_samples_norm].
+    ///
+    /// Note that this function will choose the most optimized possible call for the type `T`, so if you have
+    /// `T = i32` or `T = i16`, it will automatically call [Sink::write_samples_direct] on little endian systems.
+    ///
+    /// Returns the number of complex samples written.
+    pub fn write_samples<T: SampleConvert>(samples: &[Complex<T>]) -> Result<usize, WriteError> {
+        todo!("Implement");
+    }
+
+    /// Writes samples, as long as they are directly copyable to the binary format without any
+    /// conversion being performed. This is fast, as it's a simple, flat memory copy.
+    ///
+    /// **NOTE**: On big endian systems, the direct copy is not done, and instead "slow" loading is performed
+    ///
+    /// **NOTE**: No range-checking is done for 32-bit -> 24-bit storage, if any out of bound values are used,
+    /// they will be stored in the binary file as is, and may cause issues on users of the generated file.
+    ///
+    /// Returns the number of complex samples written.
+    pub fn write_samples_direct<T: SampleConvert>(
+        samples: &[Complex<T>],
+    ) -> Result<usize, WriteError> {
+        todo!("Implement");
+    }
+
+    /// Read samples, denormalizing them. See [SampleNormalizedConvert].
+    pub fn write_samples_denorm<T: SampleNormalizedConvert>(
+        samples: &[Complex<T>],
+    ) -> Result<usize, WriteError> {
+        todo!("Implement");
+    }
+
+    /// Read samples, with possible conversion if type `Complex<T>` does not match the binary type
+    /// in the sdriq file. This could have slight overhead.
+    /// If the binary type is too small to hold the values, they are clamped.
+    ///
+    /// Note that this function will choose the most optimized possible call for the type "T", as explained
+    /// in [Sink::get_samples].
+    ///
+    /// Returns the number of samples written.
+    pub fn write_samples_clamp<T: SampleConvert>(
+        samples: &[Complex<T>],
+    ) -> Result<usize, WriteError> {
+        todo!("Implement");
+    }
 }
 
 #[cfg(test)]
@@ -717,9 +800,6 @@ mod tests {
     use super::*;
     use num::Signed;
     use num_complex::ComplexFloat;
-
-    const I24_MIN: i32 = -8388608;
-    const I24_MAX: i32 = 8388607;
 
     #[test]
     fn test_conversion_16bit() {
