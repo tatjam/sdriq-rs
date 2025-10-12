@@ -185,9 +185,9 @@ impl Header {
         })
     }
 
-    /// Returns the number of bits that each sample takes up in the binary file,
-    /// not neccesarily equal to `samp_size`.
-    pub fn get_stored_bits_per_sample(&self) -> usize {
+    /// Returns the number of bits that each half-sample (I or Q instead of the full I/Q sample)
+    /// takes up in the binary file, not neccesarily equal to `samp_size`.
+    pub fn get_stored_bits_per_half_sample(&self) -> usize {
         match self.samp_size {
             16 => 16,
             24 => 32,
@@ -530,7 +530,7 @@ impl<R: Read> Source<R> {
     #[doc(hidden)]
     // Reads samples by memcpy as long as sizeof(T) is correct. Not intented to be used directly.
     fn get_samples_memcpy<T>(&mut self, target: &mut [Complex<T>]) -> Result<usize, ReadError> {
-        let header_bits = self.header.get_stored_bits_per_sample();
+        let header_bits = self.header.get_stored_bits_per_half_sample();
         let incoming_bits = std::mem::size_of::<T>() * 8;
         if header_bits != incoming_bits {
             return Err(ReadError::InvalidSampleSize());
@@ -587,7 +587,7 @@ impl<R: Read> Source<R> {
         &mut self,
         tgt: &mut [Complex<T>],
     ) -> Result<usize, ReadError> {
-        let header_bits = self.header.get_stored_bits_per_sample();
+        let header_bits = self.header.get_stored_bits_per_half_sample();
         match header_bits {
             32 => {
                 if TypeId::of::<T>() != TypeId::of::<i32>() {
@@ -635,7 +635,7 @@ impl<R: Read> Source<R> {
         // Try optimized functions if possible
         #[cfg(target_endian = "little")]
         {
-            let header_bits = self.header.get_stored_bits_per_sample();
+            let header_bits = self.header.get_stored_bits_per_half_sample();
             if TypeId::of::<T>() == TypeId::of::<i32>() && header_bits == 32 {
                 return self.get_samples_direct(target);
             }
@@ -835,7 +835,7 @@ impl<R: Read> Source<R> {
         // Try optimized functions if possible
         #[cfg(target_endian = "little")]
         {
-            let header_bits = self.header.get_stored_bits_per_sample();
+            let header_bits = self.header.get_stored_bits_per_half_sample();
             if TypeId::of::<T>() == TypeId::of::<i32>() && header_bits == 32 {
                 return self.get_samples_direct(target);
             }
@@ -890,6 +890,40 @@ impl<R: Read> Source<R> {
 }
 
 impl<R: Read + Seek> Source<R> {
+    /// Returns the timestamp that given sample occurs at. The sample may be out of bounds.
+    pub fn get_sample_timestamp_ms(&mut self, sample: u64) -> u64 {
+        self.get_header().start_timestamp + self.get_header().samp_rate as u64 * 1000 * sample
+    }
+
+    /// Returns the timestamp of the next sample to be read, in milliseconds since UNIX epoch.
+    pub fn get_cur_timestamp_ms(&mut self) -> Result<u64, ReadError> {
+        let sample_size = (self.get_header().get_stored_bits_per_half_sample() as u64 / 8) * 2;
+        let cur_byte = self.reader.stream_position()?;
+
+        debug_assert!(cur_byte > 32);
+        let cur_byte_after_header = cur_byte - 32;
+        debug_assert_eq!(cur_byte_after_header % sample_size, 0);
+        let cur_sample = cur_byte_after_header / sample_size;
+
+        Ok(self.get_sample_timestamp_ms(cur_sample))
+    }
+
+    /// Returns the timestamp of the last sample in the file, in milliseconds since UNIX epoch.
+    pub fn get_last_timestamp_ms(&mut self) -> Result<u64, ReadError> {
+        let sample_size = (self.get_header().get_stored_bits_per_half_sample() as u64 / 8) * 2;
+
+        let cur_byte = self.reader.stream_position()?;
+        let last_byte = self.reader.seek(SeekFrom::End(0))?;
+        self.reader.seek(SeekFrom::Start(cur_byte))?;
+
+        debug_assert!(last_byte > 32);
+        let last_byte_after_header = last_byte - 32;
+        debug_assert_eq!(last_byte_after_header % sample_size, 0);
+        let last_sample = last_byte_after_header / sample_size;
+
+        Ok(self.get_sample_timestamp_ms(last_sample))
+    }
+
     /// Sets the reader such that the next read will return the sample that's nearest to said timestamp,
     /// except if said sample would lie out of bounds of the file. Otherwise, returns a seeking error.
     /// Returns the position in samples within the file.
@@ -909,11 +943,11 @@ impl<R: Read + Seek> Source<R> {
     pub fn seek_time(&mut self, delta_ms: SeekFrom) -> Result<u64, ReadError> {
         let wanted_timestamp = match delta_ms {
             SeekFrom::Start(ms) => self.get_header().start_timestamp + ms,
-            SeekFrom::End(_) => todo!(),
-            SeekFrom::Current(_) => todo!(),
+            SeekFrom::End(ms) => (self.get_last_timestamp_ms()? as i64 + ms) as u64,
+            SeekFrom::Current(ms) => (self.get_cur_timestamp_ms()? as i64 + ms) as u64,
         };
 
-        self.seek_to_timestamp(wanted_timestamp)
+        self.seek_to_timestamp(wanted_timestamp as u64)
     }
 
     /// Sets the reader such that the next read will return the sample at given position.
@@ -926,7 +960,7 @@ impl<R: Read + Seek> Source<R> {
         // The header is 32 bytes
         let first_sample = 32;
         // Size of a COMPLEX sample!
-        let sample_size = (self.get_header().get_stored_bits_per_sample() as u64 / 8) * 2;
+        let sample_size = (self.get_header().get_stored_bits_per_half_sample() as u64 / 8) * 2;
         let cur_pos = self.reader.stream_position()?;
 
         let byte_pos = match sample {
@@ -1104,7 +1138,7 @@ impl<W: Write> Sink<W> {
         // Try optimized functions if possible
         #[cfg(target_endian = "little")]
         {
-            let header_bits = self.header.get_stored_bits_per_sample();
+            let header_bits = self.header.get_stored_bits_per_half_sample();
             if TypeId::of::<T>() == TypeId::of::<i32>() && header_bits == 32 {
                 return self.write_all_samples_direct(samples);
             }
@@ -1150,7 +1184,7 @@ impl<W: Write> Sink<W> {
         &mut self,
         samples: &[Complex<T>],
     ) -> Result<(), WriteError> {
-        let header_bits = self.header.get_stored_bits_per_sample();
+        let header_bits = self.header.get_stored_bits_per_half_sample();
         match header_bits {
             32 => {
                 if TypeId::of::<T>() != TypeId::of::<i32>() {
@@ -1182,7 +1216,7 @@ impl<W: Write> Sink<W> {
         &mut self,
         samples: &[Complex<T>],
     ) -> Result<(), WriteError> {
-        let header_bits = self.header.get_stored_bits_per_sample();
+        let header_bits = self.header.get_stored_bits_per_half_sample();
         let incoming_bits = std::mem::size_of::<T>() * 8;
         if header_bits != incoming_bits {
             return Err(WriteError::InvalidSampleSize());
