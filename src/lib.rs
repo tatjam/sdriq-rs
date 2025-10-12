@@ -1,11 +1,11 @@
 //! # sdriq - Read and write .sdriq files
 //! **The library is in active development, the API may change!**
 //!
-//! ## Example reading
+//! ## Example
 //!
 //! ```
+//! // You can also use num_complex::Complex
 //! use sdriq::{Source, Sink, Header, Complex};
-//! // You can also use num_complex::Complex;
 //! use std::fs::File;
 //!
 //! let file = File::create("file.sdriq").unwrap();
@@ -18,14 +18,15 @@
 //!
 //! let mut sink = Sink::new(file, header).unwrap();
 //! let number = 10000;
-//! let mut samples: Vec<Complex<f32>> = (0..number).map(|i| {
-//!     let prog = i as f32 / (number - 1) as f32;
-//!     Complex::new(prog * 4000.0, prog * 2000.0 - 1.0)
-//! }).collect();
+//! let samples: Vec<Complex<f32>> = (0..number)
+//!     .map(|i| {
+//!         let prog = i as f32 / (number - 1) as f32;
+//!         Complex::new((prog - 0.5) * 4000.0, prog * 2000.0 - 1.0)
+//!     })
+//!     .collect();
 //!
-//! sink.write_all_samples_denorm(samples.as_slice());
-//! sink.flush();
-//!
+//! sink.write_all_samples_denorm(samples.as_slice()).unwrap();
+//! sink.flush().unwrap();
 //!
 //! let file = File::open("file.sdriq").unwrap();
 //! let mut source = Source::new(file).unwrap();
@@ -38,7 +39,6 @@
 //!     / (num_samples as f32);
 //!
 //! println!("Average of first {} samples = {}", num_samples, average);
-//!
 //! ```
 //!
 //! ## Development state
