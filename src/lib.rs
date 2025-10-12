@@ -1,12 +1,31 @@
 //! # sdriq - Read and write .sdriq files
 //! **The library is in active development, the API may change!**
 //!
-//! ## Example
+//! ## Example reading
 //!
-//! ```no_run
-//! use sdriq::{Source, Complex};
+//! ```
+//! use sdriq::{Source, Sink, Header, Complex};
 //! // You can also use num_complex::Complex;
 //! use std::fs::File;
+//!
+//! let file = File::create("file.sdriq").unwrap();
+//! let header = Header {
+//!     samp_rate: 12345,
+//!     center_freq: 67890,
+//!     start_timestamp: 12345,
+//!     samp_size: 24,
+//! };
+//!
+//! let mut sink = Sink::new(file, header).unwrap();
+//! let number = 10000;
+//! let mut samples: Vec<Complex<f32>> = (0..number).map(|i| {
+//!     let prog = i as f32 / (number - 1) as f32;
+//!     Complex::new(prog * 4000.0, prog * 2000.0 - 1.0)
+//! }).collect();
+//!
+//! sink.write_all_samples_denorm(samples.as_slice());
+//! sink.flush();
+//!
 //!
 //! let file = File::open("file.sdriq").unwrap();
 //! let mut source = Source::new(file).unwrap();
@@ -242,7 +261,7 @@ impl SampleConvert for i32 {
     }
 
     fn from_i24(value: i32) -> Option<Self> {
-        Some(value)
+        if is_24bit(value) { Some(value) } else { None }
     }
 
     fn from_i16_clamp(value: i16) -> Self {
@@ -250,7 +269,13 @@ impl SampleConvert for i32 {
     }
 
     fn from_i24_clamp(value: i32) -> Self {
-        value as Self
+        if value > I24_MAX {
+            I24_MAX
+        } else if value < I24_MIN {
+            I24_MIN
+        } else {
+            value
+        }
     }
 
     fn to_i16(self) -> Option<i16> {
@@ -295,11 +320,11 @@ impl SampleConvert for f32 {
         if self.is_infinite() {
             return None;
         }
-        if self < i16::MIN as f32 || self > i16::MAX as f32 {
+        if self.trunc() < i16::MIN as f32 || self.trunc() > i16::MAX as f32 {
             return None;
         }
 
-        Some(self as i16)
+        Some(self.trunc() as i16)
     }
 
     fn to_i24(self) -> Option<i32> {
@@ -307,7 +332,7 @@ impl SampleConvert for f32 {
         if self.is_infinite() {
             return None;
         }
-        if self < I24_MIN as f32 || self > I24_MAX as f32 {
+        if self.trunc() < I24_MIN as f32 || self.trunc() > I24_MAX as f32 {
             return None;
         }
 
@@ -359,7 +384,7 @@ impl SampleConvert for f64 {
         if self.is_infinite() {
             return None;
         }
-        if self < i16::MIN as f64 || self > i16::MAX as f64 {
+        if self.trunc() < i16::MIN as f64 || self.trunc() > i16::MAX as f64 {
             return None;
         }
 
@@ -371,7 +396,7 @@ impl SampleConvert for f64 {
         if self.is_infinite() {
             return None;
         }
-        if self < I24_MIN as f64 || self > I24_MAX as f64 {
+        if self.trunc() < I24_MIN as f64 || self.trunc() > I24_MAX as f64 {
             return None;
         }
 
@@ -420,6 +445,8 @@ const I24_SCALE_F64: f64 = 1.0 / F64_SCALE_I24;
 ///
 /// This guarantees 0 is mapped to 0. The error introduced is insignificant for almost any use, but be aware that
 /// the returned values will always be contained in the interval [-1, 1).
+///
+/// When "denormalizing" numbers, clamping is done for convenience, as otherwise the value 1 cannot be used!
 pub trait SampleNormalizedConvert: Copy + Sized {
     fn from_i16_norm(value: i16) -> Self;
     fn from_i24_norm(value: i32) -> Self;
@@ -439,14 +466,12 @@ impl SampleNormalizedConvert for f32 {
     }
 
     fn to_i16_denorm(&self) -> i16 {
-        let denorm = *self * F32_SCALE_I16;
-        debug_assert!(i16::MIN as f32 <= denorm && denorm <= i16::MAX as f32);
+        let denorm = (*self * F32_SCALE_I16).clamp(I24_MIN as f32, I24_MAX as f32);
         denorm as i16
     }
 
     fn to_i24_denorm(&self) -> i32 {
-        let denorm = *self * F32_SCALE_I24;
-        debug_assert!(I24_MIN as f32 <= denorm && denorm <= I24_MAX as f32);
+        let denorm = (*self * F32_SCALE_I24).clamp(I24_MIN as f32, I24_MAX as f32);
         denorm as i32
     }
 }
@@ -463,14 +488,12 @@ impl SampleNormalizedConvert for f64 {
     }
 
     fn to_i16_denorm(&self) -> i16 {
-        let denorm = *self * F64_SCALE_I16;
-        debug_assert!(i16::MIN as f64 <= denorm && denorm <= i16::MAX as f64);
+        let denorm = (*self * F64_SCALE_I16).clamp(I24_MIN as f64, I24_MAX as f64);
         denorm as i16
     }
 
     fn to_i24_denorm(&self) -> i32 {
-        let denorm = *self * F64_SCALE_I24;
-        debug_assert!(I24_MIN as f64 <= denorm && denorm <= I24_MAX as f64);
+        let denorm = (*self * F64_SCALE_I24).clamp(I24_MIN as f64, I24_MAX as f64);
         denorm as i32
     }
 }
@@ -591,7 +614,9 @@ impl<R: Read> Source<R> {
 
     /// Read samples, with possible conversion if type `Complex<T>` does not match the incoming type
     /// from the sdriq file. This could have slight overhead.
-    /// If the conversion would result in truncation (for example, 24 bits -> i16), an error is generated.
+    /// If the conversion would result in truncation (for example, 24 bits -> i16), an error is generated, except
+    /// if the optimized function is used (i.e. if you use 24 bit samples from a 24 bit file) on little endian systems,
+    /// where a memcpy is performed and could result in samples outside the 24 bit bounds if the original file is malformed.
     ///
     /// No truncation errors are ever generated is T is a floating point number, as 24 bit integers can fully
     /// fit into f32.
@@ -618,6 +643,22 @@ impl<R: Read> Source<R> {
         }
 
         // Fallback "slow" method
+        self.get_samples_boundcheck(target)
+    }
+
+    /// Read samples, with possible conversion if type `Complex<T>` does not match the incoming type
+    /// from the sdriq file, and with guaranteed bounds checking. This could have slight overhead.
+    /// If the conversion would result in truncation (for example, 24 bits -> i16), an error is generated.
+    ///
+    /// No truncation errors are ever generated is T is a floating point number, as 24 bit integers can fully
+    /// fit into f32.
+    /// Note that the resulting floating point numbers are NOT normalized!
+    ///
+    /// Returns the number of complex samples read.
+    pub fn get_samples_boundcheck<T: SampleConvert + 'static>(
+        &mut self,
+        target: &mut [Complex<T>],
+    ) -> Result<usize, ReadError> {
         let mut num_read = 0;
         while num_read < target.len() {
             let maybe_smp = match self.header.samp_size {
@@ -979,7 +1020,30 @@ impl<W: Write> Sink<W> {
     /// `T = i32` or `T = i16`, it will automatically call [Sink::write_samples_direct] on little endian systems.
     ///
     /// Returns the number of complex samples written.
-    pub fn write_all_samples<T: SampleConvert>(
+    pub fn write_all_samples<T: SampleConvert + 'static>(
+        &mut self,
+        samples: &[Complex<T>],
+    ) -> Result<(), WriteError> {
+        // Try optimized functions if possible
+        #[cfg(target_endian = "little")]
+        {
+            let header_bits = self.header.get_stored_bits_per_sample();
+            if TypeId::of::<T>() == TypeId::of::<i32>() && header_bits == 32 {
+                return self.write_all_samples_direct(samples);
+            }
+            if TypeId::of::<T>() == TypeId::of::<i16>() && header_bits == 16 {
+                return self.write_all_samples_direct(samples);
+            }
+        }
+
+        // Fallback otherwise
+        self.write_all_samples_boundcheck(samples)
+    }
+
+    /// Writes samples, with guaranteed bounds checking.
+    ///
+    /// Returns the number of complex samples written.
+    pub fn write_all_samples_boundcheck<T: SampleConvert>(
         &mut self,
         samples: &[Complex<T>],
     ) -> Result<(), WriteError> {
@@ -997,7 +1061,8 @@ impl<W: Write> Sink<W> {
     /// Writes samples, as long as they are directly copyable to the binary format without any
     /// conversion being performed. This is fast, as it's a simple, flat memory copy.
     ///
-    /// **NOTE**: On big endian systems, the direct copy is not done, and instead "slow" loading is performed
+    /// **NOTE**: On big endian systems, the direct copy is not done, and instead "slow" loading is performed.
+    ///     This means that the behavior is slightly different, as on debug builds range checking will be performed!
     ///
     /// **NOTE**: No range-checking is done for 32-bit -> 24-bit storage, if any out of bound values are used,
     /// they will be stored in the binary file as is, and may cause issues on users of the generated file. Note that
@@ -1101,10 +1166,13 @@ impl<W: Write> Sink<W> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
+    use std::{
+        fs::File,
+        ops::{Div, Mul},
+    };
 
     use super::*;
-    use num::Signed;
+    use num::{NumCast, Signed};
 
     #[test]
     fn test_conversion_16bit() {
@@ -1589,5 +1657,353 @@ mod tests {
         let read_header = Header::read_from(&mut as_slice).unwrap();
 
         assert_eq!(read_header, header);
+    }
+
+    fn generate_samples<T>(max: T, samp_size: u32) -> (Vec<Complex<T>>, Header)
+    where
+        T: Copy + Div<Output = T> + Mul<Output = T> + NumCast + Signed + SampleConvert,
+    {
+        let header = Header {
+            samp_rate: 5000,
+            center_freq: 10000,
+            start_timestamp: 1759600000,
+            samp_size: samp_size,
+        };
+
+        let mut samples = Vec::<Complex<T>>::new();
+        let divisor = T::from(1000).unwrap();
+        let scale = max / divisor;
+
+        for i in -1000..1000 {
+            let i_val = T::from(i).unwrap();
+            samples.push(Complex::<T>::new(i_val * scale, -i_val * scale));
+        }
+
+        (samples, header)
+    }
+
+    #[test]
+    fn write_and_read_24bit() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let (samples, header) = generate_samples(I24_MAX, 24);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 4);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<i32>::new(0, 0); samples.len()];
+        let num_read = source.get_samples(expect_samples.as_mut_slice()).unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_eq!(samples, expect_samples);
+    }
+
+    #[test]
+    fn write_and_read_16bit() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let (samples, header) = generate_samples(i16::MAX, 16);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 2);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<i16>::new(0, 0); samples.len()];
+        let num_read = source.get_samples(expect_samples.as_mut_slice()).unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_eq!(samples, expect_samples);
+    }
+
+    #[test]
+    #[should_panic]
+    fn write_and_read_16bit_oob() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let (samples, header) = generate_samples::<i32>(i32::MAX, 16);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples(samples.as_slice()).unwrap();
+        }
+    }
+
+    #[test]
+    fn write_direct_and_read_24bit() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let (samples, header) = generate_samples(I24_MAX, 24);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples_direct(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 4);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<i32>::new(0, 0); samples.len()];
+        let num_read = source.get_samples(expect_samples.as_mut_slice()).unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_eq!(samples, expect_samples);
+    }
+
+    #[test]
+    // On big endian systems, write_all_samples falls back to "non-streamlined" writer
+    #[cfg_attr(not(target_endian = "little"), should_panic)]
+    fn write_24bit_oob() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let (samples, header) = generate_samples(I24_MAX * 20, 24);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples(samples.as_slice()).unwrap();
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn write_24bit_oob_checked() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let (samples, header) = generate_samples(I24_MAX * 20, 24);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples_boundcheck(samples.as_slice())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    // On big endian systems, write_all_samples_direct falls back to "non-streamlined" writer
+    #[cfg_attr(not(target_endian = "little"), should_panic)]
+    fn write_direct_and_read_24bit_oob() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let (samples, header) = generate_samples(I24_MAX * 20, 24);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples_direct(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 4);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<i32>::new(0, 0); samples.len()];
+        let num_read = source.get_samples(expect_samples.as_mut_slice()).unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_eq!(samples, expect_samples);
+    }
+
+    #[test]
+    #[should_panic]
+    fn write_direct_and_read_24bit_oob_checked_read() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let (samples, header) = generate_samples(I24_MAX * 20, 24);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples_direct(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 4);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<i32>::new(0, 0); samples.len()];
+        source
+            .get_samples_boundcheck(expect_samples.as_mut_slice())
+            .unwrap();
+    }
+
+    #[test]
+    fn write_direct_and_read_16bit() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let (samples, header) = generate_samples(i16::MAX, 16);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples_direct(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 2);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<i16>::new(0, 0); samples.len()];
+        let num_read = source.get_samples(expect_samples.as_mut_slice()).unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_eq!(samples, expect_samples);
+    }
+
+    #[test]
+    fn write_clamp_and_read_24bit() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let (samples, header) = generate_samples(I24_MAX * 20, 24);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples_clamp(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 4);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<i32>::new(0, 0); samples.len()];
+        let num_read = source.get_samples(expect_samples.as_mut_slice()).unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_ne!(samples, expect_samples);
+    }
+
+    #[test]
+    fn write_clamp_and_read_16bit() {
+        let mut buffer: Vec<u8> = Vec::new();
+        let (samples, header) = generate_samples::<i32>(I24_MAX * 20, 16);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples_clamp(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 2);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<i32>::new(0, 0); samples.len()];
+        let num_read = source.get_samples(expect_samples.as_mut_slice()).unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_ne!(samples, expect_samples);
+    }
+
+    #[test]
+    fn write_float_and_read_24bit() {
+        let mut buffer: Vec<u8> = Vec::new();
+        // Note we cannot each 1 on positive numbers!
+        let (samples, header) = generate_samples::<f32>(I24_MAX as f32, 24);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 4);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<f32>::new(0.0, 0.0); samples.len()];
+        let num_read = source.get_samples(expect_samples.as_mut_slice()).unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_ne!(samples, expect_samples);
+    }
+
+    #[test]
+    fn write_denorm_and_read_24bit_norm() {
+        let mut buffer: Vec<u8> = Vec::new();
+        // Note we cannot each 1 on positive numbers!
+        let (samples, header) = generate_samples::<f32>(1.0, 24);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples_denorm(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 4);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<f32>::new(0.0, 0.0); samples.len()];
+        let num_read = source
+            .get_samples_norm(expect_samples.as_mut_slice())
+            .unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_ne!(samples, expect_samples);
+    }
+
+    #[test]
+    fn write_denorm_and_read_16bit() {
+        let mut buffer: Vec<u8> = Vec::new();
+        // Note we cannot each 1 on positive numbers!
+        let (samples, header) = generate_samples::<f32>(1.0, 16);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples_denorm(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 2);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<f32>::new(0.0, 0.0); samples.len()];
+        let num_read = source
+            .get_samples_norm(expect_samples.as_mut_slice())
+            .unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_ne!(samples, expect_samples);
+    }
+
+    #[test]
+    fn write_denorm_64bit_and_read_24bit_norm() {
+        let mut buffer: Vec<u8> = Vec::new();
+        // Note we cannot each 1 on positive numbers!
+        let (samples, header) = generate_samples::<f64>(1.0, 24);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples_denorm(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 4);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<f64>::new(0.0, 0.0); samples.len()];
+        let num_read = source
+            .get_samples_norm(expect_samples.as_mut_slice())
+            .unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_ne!(samples, expect_samples);
+    }
+
+    #[test]
+    fn write_denorm_64bit_and_read_16bit() {
+        let mut buffer: Vec<u8> = Vec::new();
+        // Note we cannot each 1 on positive numbers!
+        let (samples, header) = generate_samples::<f64>(1.0, 16);
+
+        {
+            let mut sink = Sink::new(&mut buffer, header).unwrap();
+            sink.write_all_samples_denorm(samples.as_slice()).unwrap();
+        }
+
+        assert_eq!(buffer.len(), 32 + samples.len() * 2 * 2);
+
+        let mut source = Source::new(buffer.as_slice()).unwrap();
+        let mut expect_samples = vec![Complex::<f64>::new(0.0, 0.0); samples.len()];
+        let num_read = source
+            .get_samples_norm(expect_samples.as_mut_slice())
+            .unwrap();
+
+        assert_eq!(source.get_header(), header);
+        assert_eq!(num_read, samples.len());
+        assert_ne!(samples, expect_samples);
     }
 }
