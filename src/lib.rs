@@ -52,7 +52,7 @@
 
 use std::{
     any::TypeId,
-    io::{BufRead, BufReader, BufWriter, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     ptr::slice_from_raw_parts,
 };
 use thiserror::Error;
@@ -73,6 +73,8 @@ pub enum ReadError {
     InvalidSampleSize(),
     #[error("Reading sample would truncate")]
     TruncationError(),
+    #[error("File does not contain a integer number of complex samples")]
+    FileIncomplete(),
 }
 
 #[derive(Error, Debug)]
@@ -884,6 +886,81 @@ impl<R: Read> Source<R> {
         }
 
         Ok(num_read)
+    }
+}
+
+impl<R: Read + Seek> Source<R> {
+    /// Sets the reader such that the next read will return the sample that's nearest to said timestamp,
+    /// except if said sample would lie out of bounds of the file. Otherwise, returns a seeking error.
+    /// Returns the position in samples within the file.
+    pub fn seek_to_timestamp(&mut self, timestamp_ms: u64) -> Result<u64, ReadError> {
+        let delta_t_ms = timestamp_ms as i64 - self.get_header().start_timestamp as i64;
+
+        // Sample rate in samples / ms
+        let samp_rate_ms = self.get_header().samp_rate as i64 * 1000;
+        debug_assert!(samp_rate_ms > 0);
+
+        // This perform rounding division, so long as samp_rate is positive
+        let delta_sample = (delta_t_ms + samp_rate_ms / 2) / samp_rate_ms;
+
+        return self.seek(SeekFrom::Start(delta_sample as u64));
+    }
+
+    pub fn seek_time(&mut self, delta_ms: SeekFrom) -> Result<u64, ReadError> {
+        let wanted_timestamp = match delta_ms {
+            SeekFrom::Start(ms) => self.get_header().start_timestamp + ms,
+            SeekFrom::End(_) => todo!(),
+            SeekFrom::Current(_) => todo!(),
+        };
+
+        self.seek_to_timestamp(wanted_timestamp)
+    }
+
+    /// Sets the reader such that the next read will return the sample at given position.
+    /// Returns the position in samples within the file.
+    /// Seeking to a negative out-of-bounds position is NOT ALLOWED, and
+    /// returns an error (`std::io::ErrorKind::InvalidInput`). Seeking after the end
+    /// of the Reader depends on which reader type you use. For File, it will allow it,
+    /// but afterwards return EOF on any read call.
+    pub fn seek(&mut self, sample: SeekFrom) -> Result<u64, ReadError> {
+        // The header is 32 bytes
+        let first_sample = 32;
+        // Size of a COMPLEX sample!
+        let sample_size = (self.get_header().get_stored_bits_per_sample() as u64 / 8) * 2;
+        let cur_pos = self.reader.stream_position()?;
+
+        let byte_pos = match sample {
+            SeekFrom::Start(x) => self
+                .reader
+                .seek(SeekFrom::Start(first_sample + x * sample_size))?,
+            SeekFrom::End(x) => {
+                let end_pos = self.reader.seek(SeekFrom::End(0))?;
+                let epos = x * sample_size as i64 + end_pos as i64;
+                if epos < first_sample as i64 {
+                    self.reader.seek(SeekFrom::Start(cur_pos))?;
+                    return Err(ReadError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid seek to a negative position",
+                    )));
+                }
+                self.reader.seek(SeekFrom::Start(epos as u64))?
+            }
+            SeekFrom::Current(x) => {
+                let epos = x * sample_size as i64 + cur_pos as i64;
+                if epos < first_sample as i64 {
+                    return Err(ReadError::IOError(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "invalid seek to a negative position",
+                    )));
+                }
+                self.reader.seek(SeekFrom::Start(epos as u64))?
+            }
+        };
+
+        let byte_after_start = byte_pos - 32;
+        debug_assert_eq!(byte_after_start % sample_size, 0);
+
+        Ok(byte_after_start / sample_size)
     }
 }
 
